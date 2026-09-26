@@ -81,6 +81,14 @@ F_HOP = 32
 DEC_FRAMES = 256      # deconly window
 S_DEC = DEC_FRAMES * UPS
 
+# encode: fixed reference-window latent frames (12.5 Hz). The auto-voice prompt
+# budget (built-in presets: T=126 latent) needs ~10 s of reference audio, so the
+# encode transformer is sized for ENC_MAX frame pairs. ENC_S = ENC_MAX*UPS = the
+# 200 Hz feature seq the encoder transformer sees when the window is full.
+ENC_MAX = 160               # 12.8 s reference @ 12.5 Hz
+ENC_S = ENC_MAX * UPS       # 2560 (200 Hz features)
+ENC_AUDIO = ENC_MAX * SPF   # samples in a full window
+
 BANNED = {"GATHER", "GATHER_ND", "TOPK_V2", "GELU", "ERF", "WHERE", "SELECT", "SELECT_V2",
           "BROADCAST_TO", "POW", "TRANSPOSE_CONV", "CAST", "EMBEDDING_LOOKUP",
           "RFFT2D", "FFT", "STFT", "COMPLEX", "RFFT", "IRFFT", "CUMSUM"}
@@ -303,6 +311,71 @@ def load_eager():
     from pocket_tts import TTSModel
     model = TTSModel.load_model()
     model.eval()
+    return model
+
+
+def inject_encoder_weights(model, onnx_path=None):
+    """Load the reference-audio encoder weights into the eager model in place.
+
+    The bundled (without-voice-cloning) weights zero the whole encoder so the
+    shipped app cannot clone: `TTSModel.load_model()` falls back to the
+    no-cloning bundle and marks `has_voice_cloning=False`. But the Mimi codec
+    (encoder + decoder + both transformers) is bit-identical between the
+    english_2026-04 and english_2026-09 releases — the robustness fine-tune
+    only re-distilled the flow-LM. So the encoder from the fp32 english_2026-04
+    ONNX export (`mimi_encoder.onnx`) is byte-compatible with the 2026-09 flow-LM
+    we deploy. Only `speaker_proj_weight` (part of the flow-LM) is taken from
+    the live no-cloning bundle the script already loaded.
+
+    We transfer every `mimi.*` initializer the ONNX carries that also exists
+    under the eager model's `mimi.*` namespace (SEANet encoder, encoder
+    transformer, downsample). `speaker_proj` in the ONNX graph is a folded
+    [32,1024] linear that is NOT copied here: the eager `flow_lm` value is the
+    authoritative 2026-09 weight and matches the deployed fused LM.
+
+    Returns the injected model (same object, mutated).
+    """
+    import onnx
+    if onnx_path is None:
+        here = os.path.dirname(os.path.abspath(__file__))
+        # default matches the onnx-web-bench fetched fp32 english_2026-04 mirror
+        cands = [
+            os.path.join(here, "../../../audiobook/onnx-web-bench/pocket-model"
+                               "/english_2026-04-fp32/mimi_encoder.onnx"),
+        ]
+        onnx_path = cands[0]
+    assert os.path.exists(onnx_path), f"encoder ONNX not found: {onnx_path}"
+    g = onnx.load(onnx_path).graph
+    inits = {t.name: t for t in g.initializer}
+    got = 0
+    for name, t in inits.items():
+        if not name.startswith("mimi."):
+            continue
+        if "encoder_transformer.transformer.layers." not in name and \
+           "mimi.encoder.model." not in name and \
+           "mimi.downsample." not in name:
+            continue
+        arr = np.frombuffer(t.raw_data, dtype=np.float32).reshape(list(t.dims))
+        # eager namespace lookup
+        mod = model
+        ok = False
+        try:
+            parts = name.split(".")
+            obj = mod
+            for p in parts[:-1]:
+                obj = obj.__getattr__(p)
+            leaf = getattr(obj, parts[-1])
+            if isinstance(leaf, torch.Tensor):
+                if tuple(leaf.shape) != tuple(arr.shape):
+                    print(f"  [inject] SKIP {name}: shape {leaf.shape} vs ONNX {arr.shape}")
+                    continue
+                leaf.data.copy_(torch.from_numpy(arr))
+                got += 1
+                ok = True
+        except Exception as e:
+            print(f"  [inject] SKIP {name}: {e}")
+    print(f"[inject] encoder weights from {os.path.basename(onnx_path)}: {got} tensors")
+    model.mimi.encoder.eval()
     return model
 
 
@@ -748,6 +821,117 @@ class MimiDecOnly(nn.Module):
         return x
 
 
+class MimiEncode(nn.Module):
+    """audio[1,1,ENC_AUDIO] -> speaker conditioning cond[1,ENC_MAX,1024].
+
+    The reference-audio path of the pocket-tts clone: SEANet encoder -> 2-layer
+    encoder transformer (MimiTx) -> ConvDownsample1d (replicate-padded) ->
+    speaker_proj. Fixed length ENC_MAX latent frames; the app slices the real
+    frame count off the graph output.
+
+    Unlike the decoder transformers, the encoder transformer is a full causal
+    seq (not sliding-block): the clone reference is short enough to run in one
+    fixed-length pass, and we need every position's conditioning simultaneously.
+
+    Weights: the shipped pocket-tts-without-voice-cloning bundle zeroes the
+    encoder (no-cloning variant). The build script injects the real encoder
+    weights from the same-Mimi english legacy bundle before this class runs
+    (see inject_encoder_weights) — the Mimi codec is shared 2026-04/2026-09.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        from pocket_tts.modules.conv import StreamingConv1d
+        from pocket_tts.modules.seanet import SEANetResnetBlock
+        enc = model.mimi.encoder
+        steps = []
+        for layer in enc.model:
+            if isinstance(layer, StreamingConv1d):
+                conv = layer.conv
+                pad = layer._effective_kernel_size - layer._stride
+                steps.append(("conv", conv, pad))
+            elif isinstance(layer, SEANetResnetBlock):
+                sub = []
+                for el in layer.block:
+                    if isinstance(el, nn.ELU):
+                        sub.append(("elu", None, None))
+                    else:
+                        pad = el._effective_kernel_size - el._stride
+                        sub.append(("conv", el.conv, pad))
+                steps.append(("res", sub, None))
+            elif isinstance(layer, nn.ELU):
+                steps.append(("elu", None, None))
+            else:
+                raise RuntimeError(f"unexpected layer {type(layer)}")
+        self.enc_mods = nn.ModuleList()
+        self.enc_plan = []
+        L = ENC_AUDIO
+
+        def add_conv(conv, pad, length):
+            self.enc_mods.append(conv)
+            self.enc_plan.append(("conv", len(self.enc_mods) - 1, pad))
+            return (length + pad - ((conv.kernel_size[0] - 1) * conv.dilation[0] + 1)) \
+                // conv.stride[0] + 1
+
+        i = 0
+        flat = []
+        for kind, obj, pad in steps:
+            if kind == "res":
+                flat.append(("res_open", None, None))
+                for k2, o2, p2 in obj:
+                    flat.append((k2, o2, p2))
+                flat.append(("res_close", None, None))
+            else:
+                flat.append((kind, obj, pad))
+        for kind, obj, pad in flat:
+            if kind == "conv":
+                L = add_conv(obj, pad, L)
+            elif kind == "elu":
+                self.enc_plan.append(("elu", None, None))
+            elif kind == "res_open":
+                self.enc_plan.append(("res_open", None, None))
+            elif kind == "res_close":
+                self.enc_plan.append(("res_close", None, None))
+        self.enc_elu = CleanELU()
+
+        # encoder transformer: same 2-layer causal project-transformer,
+        # full-length over ENC_S 200 Hz features
+        self.tx = MimiTx(model.mimi.encoder_transformer, ENC_S)
+
+        # ConvDownsample1d: StreamingConv1d(k=2*stride, stride, replicate)
+        ds = model.mimi.downsample.conv
+        self.ds_pad = ds._effective_kernel_size - ds._stride          # 16
+        self.ds_conv = ds.conv                                         # [32,512,32]
+
+        # speaker_proj -> [1,ENC_MAX,1024]
+        self.sp_w = nn.Parameter(model.flow_lm.speaker_proj_weight.detach().clone())
+
+    def forward(self, audio):
+        # 1. SEANet encoder (streaming left-pads at constant(=zero))
+        x = audio
+        stack = []
+        for kind, idx, pad in self.enc_plan:
+            if kind == "conv":
+                x = self.enc_mods[idx](F.pad(x, (pad, 0)))
+            elif kind == "elu":
+                x = self.enc_elu(x)
+            elif kind == "res_open":
+                stack.append(x)
+            elif kind == "res_close":
+                x = x + stack.pop()
+        # x [1,512,ENC_S] at 200 Hz
+        # 2. encoder transformer
+        x = self.tx(x.transpose(1, 2)).transpose(1, 2)                # [1,512,ENC_S]
+        # 3. downsample (replicate left-pad = repeat first frame)
+        # repeat() lowers to BROADCAST_TO (banned); build via slice+concat
+        first = torch.cat([x[:, :, :1]] * self.ds_pad, dim=-1)
+        y = self.ds_conv(torch.cat([first, x], dim=-1))
+        # y [1,32,ENC_MAX]
+        y = y.transpose(1, 2)                                        # [1,ENC_MAX,32]
+        # 4. speaker proj
+        return F.linear(y, self.sp_w)                                # [1,ENC_MAX,1024]
+
+
 # ============================================================== eager tracing
 def record_reference(model, voice, text, seed=1234):
     """Run the real generate_audio while recording noises, latents, conds, tokens."""
@@ -1059,6 +1243,41 @@ def stage_deconly(model):
     return g
 
 
+def stage_encode(model):
+    print("\n=== mimi encode (reference-audio -> conditioning) ===")
+    inject_encoder_weights(model)
+    g = MimiEncode(model).eval()
+    print(f"encode window: audio[1,1,{ENC_AUDIO}] -> cond[1,{ENC_MAX},1024]")
+
+    # eager reference: model._encode_audio on padding-to-ENC_AUDIO audio.
+    # Use a real-ish reference: 10 s of speech-like signal (varying pitch+amp).
+    sr = model.sample_rate
+    ns = ENC_AUDIO
+    t = torch.arange(ns, dtype=torch.float32) / sr
+    audio = (0.25 * torch.sin(2 * torch.pi * 180 * t)
+             + 0.15 * torch.sin(2 * torch.pi * 377 * t)
+             + 0.1 * torch.sin(2 * torch.pi * 913 * t)) * (0.5 + 0.5 * torch.cos(2 * torch.pi * 0.4 * t))
+    audio = audio[None, None]
+    with torch.no_grad():
+        cond_ref = model._encode_audio(audio)              # [1,ENC_MAX,1024]
+        cond_g = g(audio)
+    print(f"tflite(module) encode vs eager: corr {corr(cond_g.numpy(), cond_ref.numpy()):.6f} "
+          f"max|d| {maxd(cond_g.numpy(), cond_ref.numpy()):.2e}")
+    assert corr(cond_g.numpy(), cond_ref.numpy()) > 0.999, "encode parity FAILED"
+
+    p = convert(g, (torch.zeros(1, 1, ENC_AUDIO),), os.path.join(OUT, "pt_mimi_encode.tflite"))
+    opcheck(p, "encode")
+    to_fp16(p, os.path.join(OUT, "pt_mimi_encode_fp16.tflite"))
+    to_int8(p, os.path.join(OUT, "pt_mimi_encode_int8.tflite"))
+    opcheck(os.path.join(OUT, "pt_mimi_encode_int8.tflite"), "encode_int8")
+
+    cm = CM(p)
+    outs = cm(audio.numpy())[0]
+    print(f"tflite encode corr {corr(outs, cond_ref.numpy()):.6f} "
+          f"max|d| {maxd(outs, cond_ref.numpy()):.2e}")
+    return g
+
+
 def stage_assets(model):
     print("\n=== host assets ===")
     flm = model.flow_lm
@@ -1219,6 +1438,8 @@ def main():
         stage_dectx(model)
     if stage in ("deconly", "all"):
         stage_deconly(model)
+    if stage in ("encode", "all"):
+        stage_encode(model)
     if stage in ("assets", "all"):
         stage_assets(model)
     if stage in ("pipeline", "all"):

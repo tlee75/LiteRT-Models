@@ -165,8 +165,9 @@ class MainActivity : Activity() {
                     val r = s.synthesize(text, voice)
                     saveWav(r.audio, voice)
                     val secs = r.audio.size.toFloat() / PocketTtsSynthesizer.SAMPLE_RATE
-                    val rtf = secs * 1000f / r.ms
-                    val line = "Spoke %.1fs (%d frames) in %d ms — %.2fx real-time (%s)"
+                    // Standard RTF = wall / audio (1.0 = real-time, lower = faster).
+                    val rtf = r.ms / (secs * 1000f)
+                    val line = "Spoke %.1fs (%d frames) in %d ms — RTF %.2f (%s)"
                         .format(secs, r.frames, r.ms, rtf, s.placements)
                     android.util.Log.i("PocketTTS", line)
                     // Play first; the waveform starts exactly when audio starts
