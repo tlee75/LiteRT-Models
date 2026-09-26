@@ -104,22 +104,9 @@ class PocketTtsSynthesizer(
     private val modelDir =
         requireNotNull(context.getExternalFilesDir(null)) { "External storage unavailable" }
 
-    /**
-     * Files bundled in the APK (assets/) are copied to the files dir on first
-     * launch. This is what removes the need for an HF token at runtime: the
-     * voice-clone encoder is baked from the gated `kyutai/pocket-tts` at BUILD
-     * time and ships inside the app; users never download gated weights.
-     */
-    private val bundledAssets = setOf(ENCODER, BOS_VOICE)
-
     private fun path(name: String): File {
         val f = File(modelDir, name)
-        if (!f.exists() && name in bundledAssets) {
-            context.assets.open(name).use { input ->
-                f.outputStream().use { out -> input.copyTo(out, 1 shl 16) }
-            }
-        }
-        check(f.exists()) { "Missing $name — push files first: scripts/install_to_device.sh" }
+        check(f.exists()) { "Missing $name — fetch via the Files screen or push files first" }
         return f
     }
 
@@ -354,11 +341,12 @@ class PocketTtsSynthesizer(
     private val deconly = deconlyP.first
 
     // Clone encoder: fp32 graph, always CPU (one-shot reference encode; keeps
-    // Adreno fp16 compute quirks away from the clone path entirely). The fp32
-    // graph + prompt-BOS are bundled in the APK and extracted on first use.
+    // Adreno fp16 compute quirks away from the clone path entirely). Fetched
+    // like any other hosted graph (Files screen / adb push); absent => enc:off
+    // and cloning is unavailable until the file is present.
     private val encoder =
-        if (path(ENCODER).exists())
-            CompiledModel.create(path(ENCODER).absolutePath, cpuOpts(), null)
+        if (File(modelDir, ENCODER).exists())
+            CompiledModel.create(File(modelDir, ENCODER).absolutePath, cpuOpts(), null)
         else null
 
     /** e.g. "lm:GPU dectx:CPU dec:GPU" — shown in the UI status line. */

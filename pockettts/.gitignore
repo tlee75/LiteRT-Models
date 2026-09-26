@@ -10,11 +10,6 @@
 local.properties
 # model files are pushed to the device, never committed
 *.tflite
-# EXCEPT the voice-clone encoder: it is a required app asset bundled in the
-# APK (users would otherwise need the gated kyutai/pocket-tts release), so it
-# stays in git.
-!/app/src/main/assets/pt_mimi_encode.tflite
-!/app/src/main/assets/pt_bos_before_voice_f32.bin
 
 # build outputs of the conversion scripts (models, assets, wavs)
 scripts/out/

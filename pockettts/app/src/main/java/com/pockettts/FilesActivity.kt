@@ -85,16 +85,14 @@ class FilesActivity : Activity() {
                 val sz = if (size < 0) "" else " (${size / 1048576} MiB)"
                 val sym = when {
                     present -> "●"
-                    m.bundled -> "◆"      // bundled = copied from APK on first use
                     m.onHf -> "○"
                     else -> "—"
                 }
                 sb.append("$sym ${m.name}$sz\n    ${m.note}\n")
             }
-            val missing = rows.count { it.hfPath.isNotEmpty() && !s.isPresent(it.name) }
+            val missing = rows.count { it.onHf && !s.isPresent(it.name) }
             val present = rows.count { s.isPresent(it.name) }
-            val bundled = rows.count { it.bundled }
-            sb.append("\n$present present; $bundled bundled; $missing downloadable-missing" +
+            sb.append("\n$present present; $missing downloadable-missing" +
                 if (cat == null) " ${s.statusSummary()}" else "")
             val dlEnabled = missing > 0
             download.isEnabled = dlEnabled

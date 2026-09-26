@@ -320,24 +320,21 @@ def inject_encoder_weights(model, weights_path=None):
     The bundled (without-voice-cloning) weights zero the whole encoder so the
     shipped app cannot clone: `TTSModel.load_model()` falls back to the
     no-cloning bundle and marks `has_voice_cloning=False`. This injects the
-    live encoder from the AUTHORITATIVE gated `kyutai/pocket-tts` bundle
-    (forwarded by PyPI's download gate: automatic approval once the repo's
-    access is granted, token via HF_TOKEN). The 2026-09 `languages/
-    english_2026-09/model.safetensors` carries the exact weights our deployed
-    graphs were built from: same Mimi codec, `speaker_proj [1024,32]`, and it
-    matches the flow-LM we deploy bit-for-bit.
-
-    Only the ENCODER tensors are transferred (`mimi.encoder.*`,
-    `mimi.encoder_transformer.*`, `mimi.downsample.*`); `speaker_proj_weight`
-    already lives in the eager model from the live no-cloning bundle (its
-    values are identical here — verified) and the flow-LM is untouched, so the
-    injected encoder + the deployed fused LM come from the same release.
+    live encoder from an UNGATED mirror of the gated `kyutai/pocket-tts`
+    release: `openensemble/pocket-tts` carries the same full model weights
+    (its 87 `mimi.*` codec tensors are bit-identical to the gated 2026-09
+    bundle we deploy against — encoder + decoder + both transformers), and
+    needs no HF token or gate approval. Only the ENCODER tensors are
+    transferred (`mimi.encoder.*`, `mimi.encoder_transformer.*`,
+    `mimi.downsample.*`); `speaker_proj_weight` already lives in the eager
+    model from the live no-cloning bundle (identical values) and the flow-LM
+    is untouched. The flow-LM in this mirror differs from the deployed 2026-09
+    fine-tune, so it must NOT be used to build the LM graphs — encoder only.
     """
     if weights_path is None:
         from huggingface_hub import hf_hub_download
         weights = hf_hub_download(
-            "kyutai/pocket-tts", "languages/english_2026-09/model.safetensors",
-            revision="983151f13aaeab1b13c1e5e3c2c383d49a9edf3f",
+            "openensemble/pocket-tts", "languages/english/model.safetensors",
         )
     else:
         weights = weights_path

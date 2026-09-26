@@ -14,9 +14,9 @@ import java.util.concurrent.Executors
  * the app's files dir, and reused until deleted.
  * `PocketTtsSynthesizer.path()` checks existence, so after a full download
  * nothing is re-fetched. No HF token required at runtime: everything the app
- * downloads lives on the public, ungated hosting repo (the gated
- * `kyutai/pocket-tts` encoder weights are used only at BUILD time by
- * `build_pockettts.py`, which bakes them into `pt_mimi_encode*.tflite`).
+ * downloads lives on public, ungated repos (the voice-clone encoder is baked
+ * at BUILD time by `build_pockettts.py` from the ungated
+ * `openensemble/pocket-tts` mirror of `kyutai/pocket-tts`).
  */
 class ModelStore(private val context: Context) {
 
@@ -43,9 +43,6 @@ class ModelStore(private val context: Context) {
         val hfPath: String,        // path within the HF repo ("" if not hosted)
         val note: String,          // human explanation
         val onHf: Boolean = hfPath.isNotEmpty(),
-        /** Ships inside the APK (assets/); the synth copies it to the files
-         *  dir on first use. No download at all. */
-        val bundled: Boolean = false,
         val category: Category = Category.of(name),
     )
 
@@ -61,11 +58,12 @@ class ModelStore(private val context: Context) {
             "fp32 vocoder — CPU (int8w/fp32) + CPU (FP32)"),
         Model("pt_mimi_deconly_fp16.tflite", "pt_mimi_deconly_fp16.tflite",
             "fp16 vocoder — legacy"),
-        // voice-clone encoder + its speed variants. The fp32 graph and the
-        // prompt-BOS are BUNDLED in the APK (baked from the GATED
-        // kyutai/pocket-tts at build time; no HF token at runtime). fp16/int8
-        // variants are speed experiments, not hosted.
-        Model("pt_mimi_encode.tflite", "", "voice-clone encoder (fp32) — bundled", bundled = true),
+        // voice-clone reference encoder + prompt-BOS. Built from the UNGATED
+        // openensemble/pocket-tts mirror at build time (build_pockettts.py
+        // injects the live encoder — no gated repo / HF token needed);
+        // distributed to users like the int8 graphs (adb push / our hosted
+        // files once public), not bunded in the APK.
+        Model("pt_mimi_encode.tflite", "", "voice-clone encoder (fp32) — build/push"),
         Model("pt_mimi_encode_fp16.tflite", "pt_mimi_encode_fp16.tflite",
             "voice-clone encoder (fp16)"),
         Model("pt_mimi_encode_int8.tflite", "pt_mimi_encode_int8.tflite",
@@ -75,8 +73,7 @@ class ModelStore(private val context: Context) {
         Model("pt_input_linear_f32.bin", "pt_input_linear_f32.bin", "latent projector"),
         Model("pt_bos_input_f32.bin", "pt_bos_input_f32.bin", "start-of-utterance vector"),
         Model("pt_neutral_latent_f32.bin", "pt_neutral_latent_f32.bin", "neutral latent"),
-        Model("pt_bos_before_voice_f32.bin", "", "clone prompt start-of-voice — bundled",
-            bundled = true),
+        Model("pt_bos_before_voice_f32.bin", "", "clone prompt start-of-voice — build/push"),
         Model("pt_tokenizer.tsv", "pt_tokenizer.tsv", "sentencepiece unigram table"),
     ) + PocketTtsSynthesizer.VOICES.map { v ->
         Model("pt_voice_$v.bin", "voices/pt_voice_$v.bin", "preset voice: $v")
