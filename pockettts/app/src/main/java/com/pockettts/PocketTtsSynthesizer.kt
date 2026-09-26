@@ -43,7 +43,7 @@ import kotlin.math.sqrt
  * pipeline is checked in scripts/build_pockettts.py.
  */
 class PocketTtsSynthesizer(
-    context: Context,
+    private val context: Context,
     private val engine: Profile = Profile.CPU_INT8W,
 ) : Closeable {
 
@@ -104,8 +104,21 @@ class PocketTtsSynthesizer(
     private val modelDir =
         requireNotNull(context.getExternalFilesDir(null)) { "External storage unavailable" }
 
+    /**
+     * Files bundled in the APK (assets/) are copied to the files dir on first
+     * launch. This is what removes the need for an HF token at runtime: the
+     * voice-clone encoder is baked from the gated `kyutai/pocket-tts` at BUILD
+     * time and ships inside the app; users never download gated weights.
+     */
+    private val bundledAssets = setOf(ENCODER, BOS_VOICE)
+
     private fun path(name: String): File {
         val f = File(modelDir, name)
+        if (!f.exists() && name in bundledAssets) {
+            context.assets.open(name).use { input ->
+                f.outputStream().use { out -> input.copyTo(out, 1 shl 16) }
+            }
+        }
         check(f.exists()) { "Missing $name — push files first: scripts/install_to_device.sh" }
         return f
     }
@@ -341,9 +354,10 @@ class PocketTtsSynthesizer(
     private val deconly = deconlyP.first
 
     // Clone encoder: fp32 graph, always CPU (one-shot reference encode; keeps
-    // Adreno fp16 compute quirks away from the clone path entirely).
+    // Adreno fp16 compute quirks away from the clone path entirely). The fp32
+    // graph + prompt-BOS are bundled in the APK and extracted on first use.
     private val encoder =
-        if (File(modelDir, ENCODER).exists())
+        if (path(ENCODER).exists())
             CompiledModel.create(path(ENCODER).absolutePath, cpuOpts(), null)
         else null
 
@@ -369,7 +383,7 @@ class PocketTtsSynthesizer(
     private val bosInput = readF32(path(BOS))                  // [1024]
     private val neutral = readF32(path(NEUTRAL))               // [32]
     private val bosBeforeVoice =                                // cloned prompt's first frame
-        if (File(modelDir, BOS_VOICE).exists()) readF32(path(BOS_VOICE)) else null    // [1024]
+        if (path(BOS_VOICE).exists()) readF32(path(BOS_VOICE)) else null    // [1024]
     val tokenizer = SpTokenizer(path(TOKENIZER))
 
     private val endTokens: Set<Int>

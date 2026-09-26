@@ -8,7 +8,7 @@ import android.media.AudioManager
 import android.media.AudioTrack
 import android.net.Uri
 import android.os.Bundle
-import android.os.ParcelFileDescriptor
+import android.view.View
 import android.view.ViewGroup
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -19,9 +19,11 @@ import android.widget.TextView
 import java.util.concurrent.Executors
 
 /**
- * Minimal Pocket TTS UI: pick a voice, type a sentence, tap Generate, listen.
- * Model load and generation run on a background thread; audio plays via
- * AudioTrack (float PCM) and the last output is saved to filesDir/output.wav.
+ * Audio Book UI: pick a voice, type a sentence, Generate, then Play (as many
+ * times as you want). A "Clone a new voice…" entry in the voice picker opens
+ * the system file picker; the clone runs fully on-device and becomes a
+ * resident "custom" voice. Model load and generation run on a background
+ * thread; the last output is saved to filesDir.
  */
 class MainActivity : Activity() {
 
@@ -29,19 +31,23 @@ class MainActivity : Activity() {
     private var synth: PocketTtsSynthesizer? = null
     private var rebuildSynthWithIntent = false
 
-    companion object { private const val REQ_CLONE = 11 }
+    companion object {
+        private const val REQ_CLONE = 11
+        /** Terminal voice-picker entry that opens the clone file picker. */
+        const val CLONE_ENTRY = "➕ Clone a new voice…"
+    }
 
     private lateinit var status: TextView
     private lateinit var input: EditText
     private lateinit var voices: Spinner
     private lateinit var profiles: Spinner
-    private lateinit var button: Button
+    private lateinit var generate: Button
+    private lateinit var play: Button
     private lateinit var waveform: WaveformView
     private val clonePending = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    // Custom clone read result (single activity-result contract, no ActivityResulting ties
-    // kept on the v1 API so this stays a plain Activity).
-    private var cloneUri: Uri? = null
+    // Last generated audio (replayable via Play).
+    private var lastAudio: FloatArray = FloatArray(0)
 
     private fun gpuAvailable(): Boolean =
         try {
@@ -53,12 +59,32 @@ class MainActivity : Activity() {
         Profile.entries.getOrElse(
             profiles.selectedItemPosition, { Profile.CPU_INT8W })
 
+    /** Voice names in the spinner: presets + (custom if cloned) + clone entry. */
+    private fun voiceLabels(): List<String> =
+        buildList {
+            addAll(PocketTtsSynthesizer.VOICES)
+            if (hasCustomVoice) add("custom")
+            add(CLONE_ENTRY)
+        }
+
+    private var hasCustomVoice = false
+
+    private fun refreshVoiceAdapter() {
+        val pos = voices.selectedItemPosition
+        voices.adapter = ArrayAdapter(
+            this, android.R.layout.simple_spinner_dropdown_item, voiceLabels())
+        // preserve selection when possible
+        val keep = voices.adapter!!.getItem(pos)?.let { it } ?: CLONE_ENTRY
+        val idx = voiceLabels().indexOf(keep)
+        voices.setSelection(if (idx >= 0) idx else 0)
+    }
+
     /** Rebuild the synthesizer for the currently selected profile (spinner
      * change OR initial load). Runs on the background thread. */
     private fun rebuildSynth() {
         if (!::profiles.isInitialized) return
         runOnUiThread {
-            button.isEnabled = false
+            generate.isEnabled = false
             status.text = "Loading ${selectedProfile().label}…"
         }
         bg.execute {
@@ -73,7 +99,7 @@ class MainActivity : Activity() {
             android.util.Log.i("PocketTTS", "ready (${synth?.placements})")
             runOnUiThread {
                 status.text = "Ready (${synth?.placements})."
-                button.isEnabled = true
+                generate.isEnabled = true
                 if (rebuildSynthWithIntent) {
                     rebuildSynthWithIntent = false
                     runFromIntent(intent)
@@ -102,13 +128,24 @@ class MainActivity : Activity() {
             adapter = ArrayAdapter(
                 this@MainActivity,
                 android.R.layout.simple_spinner_dropdown_item,
-                PocketTtsSynthesizer.VOICES,
+                voiceLabels(),
             )
+            // selecting the terminal clone entry opens the picker
+            onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(
+                    parent: android.widget.AdapterView<*>?, v: View?,
+                    pos: Int, id: Long,
+                ) {
+                    if (voices.adapter?.getItem(pos) == CLONE_ENTRY && !clonePending.get()) {
+                        openClonePicker()
+                    }
+                }
+                override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+            }
         }
         val gpuOk = gpuAvailable()
         profiles = Spinner(this).apply {
             // All three profiles shown; Hybrid greys out when no GPU is present.
-            // isEnabled / getDropDownView drive the grey-out + non-selectable row.
             adapter = object : ArrayAdapter<Profile>(
                 this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
                 Profile.entries,
@@ -130,7 +167,7 @@ class MainActivity : Activity() {
             setSelection(0) // CPU (int8w/fp32) default
             onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
                 override fun onItemSelected(
-                    parent: android.widget.AdapterView<*>?, v: android.view.View?,
+                    parent: android.widget.AdapterView<*>?, v: View?,
                     pos: Int, id: Long,
                 ) {
                     if (getItemAtPosition(pos) == Profile.HYBRID && !gpuOk) {
@@ -141,33 +178,21 @@ class MainActivity : Activity() {
                 override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
             }
         }
-        button = Button(this).apply { text = "Generate"; isEnabled = false }
-        val cloneButton = Button(this).apply {
-            text = "Clone voice…"
-            setOnClickListener {
-                // AndroidX is not a dependency here; use the framework picker via
-                // startActivityForResult (deprecated but functional).
-                val pick = Intent(Intent.ACTION_GET_CONTENT).apply {
-                    type = "audio/*"
-                    addCategory(Intent.CATEGORY_OPENABLE)
-                }
-                try {
-                    startActivityForResult(pick, REQ_CLONE)
-                } catch (e: Throwable) {
-                    status.text = "No file picker: ${e.message}"
-                }
-            }
+        generate = Button(this).apply { text = "Generate"; isEnabled = false }
+        play = Button(this).apply {
+            text = "Play"; isEnabled = false
         }
-        val modelsButton = Button(this).apply {
-            text = "Models"
+        val filesButton = Button(this).apply {
+            text = "Files"
             setOnClickListener {
-                startActivity(android.content.Intent(this@MainActivity, ModelsActivity::class.java))
+                startActivity(Intent(this@MainActivity, FilesActivity::class.java))
             }
         }
         status = TextView(this).apply { text = "Loading model…"; textSize = 14f }
         waveform = WaveformView(this)
-        val topMargins = intArrayOf(0, 24, 24, 32, 24, 24, 24)
-        for ((index, view) in listOf(input, voices, cloneButton, profiles, button, modelsButton, status).withIndex()) {
+        // input, voices, profiles, generate, play, files, status, (waveform)
+        val topMargins = intArrayOf(0, 24, 24, 32, 0, 24, 24)
+        for ((index, view) in listOf(input, voices, profiles, generate, play, filesButton, status).withIndex()) {
             val params = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
             params.topMargin = topMargins[index]
@@ -180,43 +205,67 @@ class MainActivity : Activity() {
         rebuildSynthWithIntent = true
         rebuildSynth()
 
-        button.setOnClickListener {
+        generate.setOnClickListener {
             val text = input.text.toString().ifBlank { return@setOnClickListener }
-            val voice = voices.selectedItem as String
-            button.isEnabled = false
+            val sel = voices.selectedItem as? String ?: return@setOnClickListener
+            if (sel == CLONE_ENTRY) { openClonePicker(); return@setOnClickListener }
+            generate.isEnabled = false
             status.text = "Generating…"
             bg.execute {
                 val s = synth ?: return@execute
                 try {
-                    val r = s.synthesize(text, voice)
-                    saveWav(r.audio, voice)
+                    val r = s.synthesize(text, sel)
+                    saveWav(r.audio, sel)
+                    lastAudio = r.audio
                     val secs = r.audio.size.toFloat() / PocketTtsSynthesizer.SAMPLE_RATE
                     // Standard RTF = wall / audio (1.0 = real-time, lower = faster).
                     val rtf = r.ms / (secs * 1000f)
                     val line = "Spoke %.1fs (%d frames) in %d ms — RTF %.2f (%s)"
                         .format(secs, r.frames, r.ms, rtf, s.placements)
                     android.util.Log.i("PocketTTS", line)
-                    // Play first; the waveform starts exactly when audio starts
-                    // (inside play()) so the visual doesn't run ahead of the ear.
-                    play(r.audio) {
-                        runOnUiThread {
-                            status.text = line
-                            button.isEnabled = true
-                            waveform.start(r.audio, PocketTtsSynthesizer.SAMPLE_RATE)
-                        }
+                    runOnUiThread {
+                        status.text = line
+                        generate.isEnabled = true
+                        play.isEnabled = true
                     }
                 } catch (e: Throwable) {
                     android.util.Log.e("PocketTTS", "generation failed", e)
-                    runOnUiThread { status.text = "Error: ${e.message}"; button.isEnabled = true }
+                    runOnUiThread { status.text = "Error: ${e.message}"; generate.isEnabled = true }
                 }
             }
+        }
+
+        // Separate Play button: enabled after generate (or clone preview), can
+        // be tapped repeatedly to re-hear the last output.
+        play.setOnClickListener {
+            val audio = lastAudio
+            if (audio.isNotEmpty()) playAudio(audio)
+        }
+    }
+
+    private fun openClonePicker() {
+        // AndroidX is not a dependency here; use the framework picker via
+        // startActivityForResult (deprecated but functional).
+        val pick = Intent(Intent.ACTION_GET_CONTENT).apply {
+            type = "audio/*"
+            addCategory(Intent.CATEGORY_OPENABLE)
+        }
+        try {
+            startActivityForResult(pick, REQ_CLONE)
+        } catch (e: Throwable) {
+            status.text = "No file picker: ${e.message}"
         }
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == REQ_CLONE && resultCode == Activity.RESULT_OK && data?.data != null) {
-            cloneFromUri(data.data!!)
+        if (requestCode == REQ_CLONE) {
+            if (resultCode == Activity.RESULT_OK && data?.data != null) {
+                cloneFromUri(data.data!!)
+            } else {
+                // user cancelled: drop back to a preset selection
+                voices.setSelection(0)
+            }
         }
     }
 
@@ -227,7 +276,9 @@ class MainActivity : Activity() {
                 contentResolver.openFileDescriptor(uri, "r")!!.fileDescriptor)
                 .use { it.readBytes() }
         } catch (e: Throwable) {
-            status.text = "Clone failed: ${e.message}"; return
+            status.text = "Clone failed: ${e.message}"
+            voices.setSelection(0)
+            return
         }
         cloneFromFile(java.io.File(filesDir, "clone_ref.wav").apply { writeBytes(bytes) })
     }
@@ -235,7 +286,7 @@ class MainActivity : Activity() {
     /** Clone from a WAV on the app's filesDir, then select "custom". */
     private fun cloneFromFile(abs: java.io.File) {
         if (!clonePending.compareAndSet(false, true)) return
-        button.isEnabled = false
+        generate.isEnabled = false
         status.text = "Cloning voice…"
         bg.execute {
             try {
@@ -244,25 +295,24 @@ class MainActivity : Activity() {
                     ?: throw IllegalStateException("synthesizer not ready")
                 runOnUiThread {
                     android.util.Log.i("PocketTTS", "clone OK ($frames prompt frames)")
-                    status.text = "Cloned voice ($frames prompt frames). Selecting custom."
-                    val all = (0 until voices.adapter!!.count)
-                        .map { voices.adapter!!.getItem(it) as String }
-                        .toMutableList().apply { add("custom") }
-                    voices.adapter = ArrayAdapter(
-                        this, android.R.layout.simple_spinner_dropdown_item, all)
-                    voices.setSelection(voices.adapter!!.count - 1)
-                    button.isEnabled = true
+                    hasCustomVoice = true
+                    refreshVoiceAdapter()
+                    val idx = voiceLabels().indexOf("custom")
+                    voices.setSelection(if (idx >= 0) idx else 0)
+                    status.text = "Cloned voice ($frames prompt frames). Selected custom."
+                    generate.isEnabled = true
                     // headless (--es ref): continue to generate once cloned
                     if (intent?.hasExtra("ref") == true &&
                         input.text.toString().isNotBlank()) {
-                        button.performClick()
+                        generate.performClick()
                     }
                 }
             } catch (e: Throwable) {
                 android.util.Log.e("PocketTTS", "clone failed", e)
                 runOnUiThread {
                     status.text = "Clone failed: ${e.message}"
-                    button.isEnabled = true
+                    generate.isEnabled = true
+                    voices.setSelection(0)
                 }
             } finally {
                 clonePending.set(false)
@@ -271,14 +321,16 @@ class MainActivity : Activity() {
     }
 
     /** Headless driving: adb shell am start ... --es text "..." --es voice alba
-     *  --es profile standard|studio|fast  [--es ref /path/to/ref.wav]
+     *  --es profile cpu_int8w  [--es ref /path/to/ref.wav]
      *  `ref` clones from a WAV on the device files dir before generating.
      *  (singleTop, so a second am start generates again without reloading). */
     private fun runFromIntent(i: android.content.Intent?) {
         val t = i?.getStringExtra("text") ?: return
         input.setText(t)
         i.getStringExtra("voice")?.let { v ->
-            val idx = PocketTtsSynthesizer.VOICES.indexOf(v)
+            if (v == "custom") hasCustomVoice = true
+            refreshVoiceAdapter()
+            val idx = voiceLabels().indexOf(v)
             if (idx >= 0) voices.setSelection(idx)
         }
         i.getStringExtra("profile")?.let { e ->
@@ -289,8 +341,8 @@ class MainActivity : Activity() {
         if (ref != null) {
             val f = java.io.File(filesDir, ref)
             if (f.exists()) cloneFromFile(f) else status.text = "ref not found: $ref"
-        } else if (button.isEnabled) {
-            button.performClick()
+        } else if (generate.isEnabled) {
+            generate.performClick()
         }
     }
 
@@ -313,9 +365,9 @@ class MainActivity : Activity() {
         java.io.File(filesDir, "output_$voice.wav").writeBytes(bb.array())
     }
 
-    /** Play `audio`, invoking [onStart] the moment playback begins so the
-     *  waveform and the sound start together (not waveform-first). */
-    private fun play(audio: FloatArray, onStart: () -> Unit) {
+    /** Play `audio`; the waveform starts exactly when audio starts. Replay-safe:
+     *  each tap creates a fresh AudioTrack, so re-tapping just replays. */
+    private fun playAudio(audio: FloatArray) {
         if (audio.isEmpty()) return
         val track = AudioTrack(
             AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).build(),
@@ -328,9 +380,9 @@ class MainActivity : Activity() {
         )
         track.write(audio, 0, audio.size, AudioTrack.WRITE_BLOCKING)
         track.play()
-        onStart()
-        Thread.sleep((audio.size * 1000L / PocketTtsSynthesizer.SAMPLE_RATE) + 250)
-        track.release()
+        runOnUiThread { waveform.start(audio, PocketTtsSynthesizer.SAMPLE_RATE) }
+        Thread { Thread.sleep((audio.size * 1000L / PocketTtsSynthesizer.SAMPLE_RATE) + 250); track.release() }
+            .start()
     }
 
     override fun onDestroy() {
