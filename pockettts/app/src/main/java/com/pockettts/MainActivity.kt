@@ -132,10 +132,16 @@ class MainActivity : Activity() {
             }
         }
         button = Button(this).apply { text = "Generate"; isEnabled = false }
+        val modelsButton = Button(this).apply {
+            text = "Models"
+            setOnClickListener {
+                startActivity(android.content.Intent(this@MainActivity, ModelsActivity::class.java))
+            }
+        }
         status = TextView(this).apply { text = "Loading model…"; textSize = 14f }
         waveform = WaveformView(this)
-        val topMargins = intArrayOf(0, 24, 32, 24, 24)
-        for ((index, view) in listOf(input, voices, profiles, button, status).withIndex()) {
+        val topMargins = intArrayOf(0, 24, 32, 24, 24, 24)
+        for ((index, view) in listOf(input, voices, profiles, button, modelsButton, status).withIndex()) {
             val params = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
             params.topMargin = topMargins[index]
