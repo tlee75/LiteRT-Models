@@ -24,12 +24,47 @@ class MainActivity : Activity() {
 
     private val bg = Executors.newSingleThreadExecutor()
     private var synth: PocketTtsSynthesizer? = null
+    private var rebuildSynthWithIntent = false
 
     private lateinit var status: TextView
     private lateinit var input: EditText
     private lateinit var voices: Spinner
+    private lateinit var engines: Spinner
     private lateinit var button: Button
     private lateinit var waveform: WaveformView
+
+    private fun selectedEngine(): Engine =
+        Engine.entries.getOrElse(
+            engines.selectedItemPosition, { Engine.STANDARD })
+
+    /** Rebuild the synthesizer for the currently selected engine (spinner change
+     * OR initial load). Runs on the background thread; disabled button during. */
+    private fun rebuildSynth() {
+        if (!::engines.isInitialized) return
+        runOnUiThread {
+            button.isEnabled = false
+            status.text = "Loading ${selectedEngine().label}…"
+        }
+        bg.execute {
+            synth?.close()
+            synth = try {
+                PocketTtsSynthesizer(this, selectedEngine())
+            } catch (e: Throwable) {
+                android.util.Log.e("PocketTTS", "load failed", e)
+                runOnUiThread { status.text = "Load failed: ${e.message}" }
+                return@execute
+            }
+            android.util.Log.i("PocketTTS", "ready (${synth?.placements})")
+            runOnUiThread {
+                status.text = "Ready (${synth?.placements})."
+                button.isEnabled = true
+                if (rebuildSynthWithIntent) {
+                    rebuildSynthWithIntent = false
+                    runFromIntent(intent)
+                }
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -54,11 +89,26 @@ class MainActivity : Activity() {
                 PocketTtsSynthesizer.VOICES,
             )
         }
+        engines = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                Engine.entries.map { it.label },
+            )
+            setSelection(0) // Standard (default)
+            onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(
+                    parent: android.widget.AdapterView<*>?, v: android.view.View?,
+                    pos: Int, id: Long,
+                ) { rebuildSynth() }
+                override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+            }
+        }
         button = Button(this).apply { text = "Generate"; isEnabled = false }
         status = TextView(this).apply { text = "Loading model…"; textSize = 14f }
         waveform = WaveformView(this)
-        val topMargins = intArrayOf(0, 24, 32, 24)
-        for ((index, view) in listOf(input, voices, button, status).withIndex()) {
+        val topMargins = intArrayOf(0, 24, 32, 24, 24)
+        for ((index, view) in listOf(input, voices, engines, button, status).withIndex()) {
             val params = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
             params.topMargin = topMargins[index]
@@ -68,22 +118,8 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f).apply { topMargin = 24 })
         setContentView(root)
 
-        bg.execute {
-            val s = try {
-                PocketTtsSynthesizer(this)
-            } catch (e: Throwable) {
-                android.util.Log.e("PocketTTS", "load failed", e)
-                runOnUiThread { status.text = "Load failed: ${e.message}" }
-                return@execute
-            }
-            synth = s
-            android.util.Log.i("PocketTTS", "ready (${s.placements})")
-            runOnUiThread {
-                status.text = "Ready (${s.placements})."
-                button.isEnabled = true
-                runFromIntent(intent)
-            }
-        }
+        rebuildSynthWithIntent = true
+        rebuildSynth()
 
         button.setOnClickListener {
             val text = input.text.toString().ifBlank { return@setOnClickListener }
@@ -115,6 +151,7 @@ class MainActivity : Activity() {
     }
 
     /** Headless driving: adb shell am start ... --es text "..." --es voice alba
+     *  --es engine standard|studio|fast
      *  (singleTop, so a second am start generates again without reloading). */
     private fun runFromIntent(i: android.content.Intent?) {
         val t = i?.getStringExtra("text") ?: return
@@ -122,6 +159,10 @@ class MainActivity : Activity() {
         i.getStringExtra("voice")?.let { v ->
             val idx = PocketTtsSynthesizer.VOICES.indexOf(v)
             if (idx >= 0) voices.setSelection(idx)
+        }
+        i.getStringExtra("engine")?.let { e ->
+            val idx = Engine.entries.indexOfFirst { it.name.equals(e, true) }
+            if (idx >= 0) engines.setSelection(idx)
         }
         if (button.isEnabled) button.performClick()
     }

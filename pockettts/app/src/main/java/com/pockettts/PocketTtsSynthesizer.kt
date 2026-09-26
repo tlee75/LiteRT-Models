@@ -42,7 +42,10 @@ import kotlin.math.sqrt
  * [SpTokenizer]. Host-vs-reference parity of every graph and of the full
  * pipeline is checked in scripts/build_pockettts.py.
  */
-class PocketTtsSynthesizer(context: Context) : Closeable {
+class PocketTtsSynthesizer(
+    context: Context,
+    private val engine: Engine = Engine.STANDARD,
+) : Closeable {
 
     companion object {
         const val H = 1024               // flow-LM width
@@ -114,51 +117,46 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
     // Keys that use force_gpu_opts.txt (normally just the LM).
     private val forceGpuOpts = overrideSet("force_gpu_opts_keys.txt")
 
-    // `force_fp16_lm.txt` opts OUT of the default int8 LM. Default = *_int8
-    // graphs for LM + Mimi: weight-only int8 gives the best size (85.7 vs
-    // 169 MB) and quality, works everywhere (GPU or CPU), and the decoder
-    // placement logic below keeps it clean. The int8 graphs keep fp32 I/O so
-    // the host KV contract is unchanged.
-    private val int8 = !File(modelDir, "force_fp16_lm.txt").exists()
-    // `force_fp32_graph.txt` -> LM uses the full-fp32 graph (fp32 weights) for
-    // speed comparisons vs the fp16-weight graph at FP32 compute (GPU32).
-    private val fp32graph = File(modelDir, "force_fp32_graph.txt").exists()
-    // `force_all_fp32.txt` -> everything full-fp32 (LM + dectx + deconly), the
-    // "zero quantization anywhere" option. Same as setting force_fp32_graph +
-    // force_fp16_lm (dectx has no fp32 variant, so fp16 there) + fp32 dec.
-    private val allFp32 = File(modelDir, "force_all_fp32.txt").exists()
-    // `force_int8_dec.txt` -> force the decoder to the int8 SEANet graph even
-    // on CPU (int8-deconly hisses on device CPU; that is its known cost).
-    // Default does NOT use int8-deconly on CPU.
-    private val int8dec = File(modelDir, "force_int8_dec.txt").exists()
-    // `force_fp32_dec.txt` -> decoder uses the full-fp32 graph. This is the
-    // default deconly on CPU (cleanest, no int8/fp16 rounding in the vocoder
-    // residual stack); the knob is redundant-but-explicit.
-    private val fp32dec = File(modelDir, "force_fp32_dec.txt").exists()
+    // -- engine vs debug force-files --------------------------------------
+    // The Engine (UI) picks the default graph/placement set; the force_*.txt
+    // debug files override individual knobs when present (they win). This
+    // keeps the user-facing picker simple while preserving the bench harness.
+    private val debugInt8Out = File(modelDir, "force_fp16_lm.txt").exists()   // opt-out int8
+    private val forceAllFp32 = File(modelDir, "force_all_fp32.txt").exists()
+    private val forceFp32Lm = File(modelDir, "force_fp32_graph.txt").exists()
+    private val forceInt8Dec = File(modelDir, "force_int8_dec.txt").exists()
+    private val forceFp32Dec = File(modelDir, "force_fp32_dec.txt").exists()
+
+    // Engine → default set:
+    //   STANDARD: int8w LM/dectx + fp32-deconly, lm+dectx CPU, dec CPU.
+    //   STUDIO  : all-fp32 (LM fp32, dectx fp16, deconly fp32), all CPU.
+    //   FAST    : int8w LM/dectx + int8-deconly on GPU, lm/dectx CPU.
+    private val engineInt8 = engine == Engine.STANDARD || engine == Engine.FAST
+    private val engineAllFp32 = engine == Engine.STUDIO
+    private val engineDecGpu = engine == Engine.FAST
+
+    // final graph choice, debug files override engine
+    private val int8 = if (debugInt8Out) false else engineInt8
+    private val allFp32 = forceAllFp32 || engineAllFp32
+    private val fp32graph = forceFp32Lm || allFp32
+    private val int8dec = forceInt8Dec
+    private val fp32dec = forceFp32Dec || allFp32
+    private val decGpu = engineDecGpu
+
     // -- graph selection ---------------------------------------------------
-    // Default (int8): int8w LM + int8 dectx. Decoder depends on placement
-    // (below): fp32-deconly on CPU, int8-deconly on GPU. The obsolete
-    // "int8 with fp16-deconly" combo is REMOVED (measured worse).
-    // force_all_fp32.txt -> everything fp32 (LM fp32, dectx fp16-the-only,
-    // deconly fp32): the "no quantization anywhere" single-file option.
     private val lmPath =
         when {
-            allFp32 -> "pt_flowlm_fused.tflite"
-            !int8 && fp32graph -> "pt_flowlm_fused.tflite"
-            int8 -> "pt_flowlm_fused_int8.tflite"
-            fp32graph -> "pt_flowlm_fused.tflite"
+            allFp32 || fp32graph -> "pt_flowlm_fused.tflite"      // fp32 LM
+            int8 -> "pt_flowlm_fused_int8.tflite"                 // int8w LM
             else -> LM
         }
     private val decTxPath =
         if (int8 && !allFp32) "pt_mimi_dec_tx_int8.tflite" else DEC_TX
-    private val decOnCpu = "dec" in forceCpu || (int8 && !allFp32)
     private val deconlyPath =
         when {
-            allFp32 || fp32dec -> "pt_mimi_deconly.tflite"      // fp32 vocoder
-            int8dec -> "pt_mimi_deconly_int8.tflite"            // explicit int8
-            int8 && !decOnCpu -> "pt_mimi_deconly_int8.tflite"  // dec GPU: int8
-            int8 -> "pt_mimi_deconly.tflite"                    // default CPU: fp32
-            else -> "pt_mimi_deconly.tflite"
+            int8dec -> "pt_mimi_deconly_int8.tflite"   // explicit int8 vocoder
+            decGpu && int8 -> "pt_mimi_deconly_int8.tflite"  // FAST: dec on GPU
+            else -> "pt_mimi_deconly.tflite"           // fp32 vocoder (default)
         }
 
     // `force_dbg.txt` present -> per-step timing + latent/eos dumps. Independent
@@ -284,7 +282,12 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
     private fun load(name: String, key: String): Pair<CompiledModel, String> {
         val p = path(name).absolutePath
         val gpuRequested = key in forceGpu || key in forceFp32 || key in forceGpuOpts
-        if (key in forceCpu || (int8 && !gpuRequested)) {
+        val decGpuForEngine = decGpu && key == "dec"
+        // CPU is the default for the int8 engine AND the all-fp32 (Studio)
+        // engine — only FAST's decoder, or an explicit force-file GPU request,
+        // uses the GPU. (int8-on-GPU and fp16-compute both have known Adreno
+        // issues; CPU is the universal path.)
+        if (key in forceCpu || ((int8 || allFp32 || engine == Engine.STUDIO) && !gpuRequested && !decGpuForEngine)) {
             return CompiledModel.create(p, cpuOpts(), null) to "CPU*"
         }
         // eps override applies to the fp16 LM graph only (see force_eps.txt).
@@ -660,4 +663,18 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
         val bb = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN)
         return FloatArray(b.size / 4) { bb.float }
     }
+}
+
+/** The three user-facing configs (everything else is a debug override):
+ *   STANDARD — int8w LM/dectx + fp32-deconly, all CPU. Universal, GPU-free,
+ *              clean, RTF ~0.9. (the default)
+ *   STUDIO   — all-fp32 ("no quantization anywhere"), all CPU, max quality,
+ *              RTF ~1.1.
+ *   FAST     — int8w LM/dectx on CPU + int8 decoder on GPU, RTF ~0.3; needs a
+ *              working GPU, falls back to STANDARD on failure.
+ */
+enum class Engine(val label: String) {
+    STANDARD("Standard"),
+    STUDIO("Studio"),
+    FAST("Fast"),
 }
