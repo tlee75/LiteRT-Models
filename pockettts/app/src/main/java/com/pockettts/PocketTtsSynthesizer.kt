@@ -123,44 +123,42 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
     // `force_fp32_graph.txt` -> LM uses the full-fp32 graph (fp32 weights) for
     // speed comparisons vs the fp16-weight graph at FP32 compute (GPU32).
     private val fp32graph = File(modelDir, "force_fp32_graph.txt").exists()
-    // `force_fp16_dec.txt` -> decoder (deconly) uses the fp16 graph even when
-    // the LM/dectx are int8. Isolates the SEANet CPU-noise floor question:
-    // "android XNNPACK computes native fp16 and collapses residual streams to
-    // noise" (VibeVoice #64) — flip dec graph+placement while LM/dectx stay
-    // int8-CPU and compare the silence.
-    private val fp16dec = File(modelDir, "force_fp16_dec.txt").exists()
-    // `force_int8_dec.txt` -> force the decoder to the int8 SEANet graph.
-    // Default (below) already uses int8 deconly when the decoder runs on the
-    // GPU (clean + fast, "int8 LM-CPU / dec-GPU"); this knob also allows it
-    // on CPU even though that hisses. fp16 deconly is clean and ~1.7x the
-    // int8 speed, which is why the CPU case falls back to fp16 (see below).
-    // The old "fp16 deconly on CPU = 169 s/unusable" was the single-threaded
-    // build; with cpuOpts() threads it is RTF ~0.8-0.9.
-    private val int8dec = File(modelDir, "force_int8_dec.txt").exists() && !fp16dec
-    // `force_fp32_dec.txt` -> decoder uses the full-fp32 graph. Test: does
-    // fp32 SEANet on CPU avoid the residual-stream static entirely?
+    // `force_all_fp32.txt` -> everything full-fp32 (LM + dectx + deconly), the
+    // "zero quantization anywhere" option. Same as setting force_fp32_graph +
+    // force_fp16_lm (dectx has no fp32 variant, so fp16 there) + fp32 dec.
+    private val allFp32 = File(modelDir, "force_all_fp32.txt").exists()
+    // `force_int8_dec.txt` -> force the decoder to the int8 SEANet graph even
+    // on CPU (int8-deconly hisses on device CPU; that is its known cost).
+    // Default does NOT use int8-deconly on CPU.
+    private val int8dec = File(modelDir, "force_int8_dec.txt").exists()
+    // `force_fp32_dec.txt` -> decoder uses the full-fp32 graph. This is the
+    // default deconly on CPU (cleanest, no int8/fp16 rounding in the vocoder
+    // residual stack); the knob is redundant-but-explicit.
     private val fp32dec = File(modelDir, "force_fp32_dec.txt").exists()
+    // -- graph selection ---------------------------------------------------
+    // Default (int8): int8w LM + int8 dectx. Decoder depends on placement
+    // (below): fp32-deconly on CPU, int8-deconly on GPU. The obsolete
+    // "int8 with fp16-deconly" combo is REMOVED (measured worse).
+    // force_all_fp32.txt -> everything fp32 (LM fp32, dectx fp16-the-only,
+    // deconly fp32): the "no quantization anywhere" single-file option.
     private val lmPath =
         when {
+            allFp32 -> "pt_flowlm_fused.tflite"
+            !int8 && fp32graph -> "pt_flowlm_fused.tflite"
             int8 -> "pt_flowlm_fused_int8.tflite"
             fp32graph -> "pt_flowlm_fused.tflite"
             else -> LM
         }
-    private val decTxPath = if (int8) "pt_mimi_dec_tx_int8.tflite" else DEC_TX
-    // int8-deconly hisses on CPU (11 int8 conv weights, scales up to 1.3e-2,
-    // kept at int8 by XNNPACK); fp16-deconly on CPU is clean at RTF ~0.8-0.9.
-    // Placement-aware default:
-    //   dec forced to CPU -> fp16 deconly (clean);
-    //   dec on GPU -> int8 deconly (clean + fast, RTF ~0.27);
-    //   force_fp16_dec / force_int8_dec / force_fp32_dec override explicitly.
-    private val decOnCpu = "dec" in forceCpu || int8
+    private val decTxPath =
+        if (int8 && !allFp32) "pt_mimi_dec_tx_int8.tflite" else DEC_TX
+    private val decOnCpu = "dec" in forceCpu || (int8 && !allFp32)
     private val deconlyPath =
         when {
-            fp32dec -> "pt_mimi_deconly.tflite"
-            int8dec -> "pt_mimi_deconly_int8.tflite"
-            int8 && decOnCpu -> DECONLY                 // CPU fallback: fp16 (clean)
-            int8 -> "pt_mimi_deconly_int8.tflite"       // GPU case: int8 (fast+clean)
-            else -> DECONLY
+            allFp32 || fp32dec -> "pt_mimi_deconly.tflite"      // fp32 vocoder
+            int8dec -> "pt_mimi_deconly_int8.tflite"            // explicit int8
+            int8 && !decOnCpu -> "pt_mimi_deconly_int8.tflite"  // dec GPU: int8
+            int8 -> "pt_mimi_deconly.tflite"                    // default CPU: fp32
+            else -> "pt_mimi_deconly.tflite"
         }
 
     // `force_dbg.txt` present -> per-step timing + latent/eos dumps. Independent
