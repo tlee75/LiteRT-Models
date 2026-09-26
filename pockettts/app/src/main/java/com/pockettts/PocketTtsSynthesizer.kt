@@ -44,7 +44,7 @@ import kotlin.math.sqrt
  */
 class PocketTtsSynthesizer(
     context: Context,
-    private val engine: Engine = Engine.STANDARD,
+    private val engine: Profile = Profile.CPU_INT8W,
 ) : Closeable {
 
     companion object {
@@ -118,7 +118,7 @@ class PocketTtsSynthesizer(
     private val forceGpuOpts = overrideSet("force_gpu_opts_keys.txt")
 
     // -- engine vs debug force-files --------------------------------------
-    // The Engine (UI) picks the default graph/placement set; the force_*.txt
+    // The Profile (UI) picks the default graph/placement set; the force_*.txt
     // debug files override individual knobs when present (they win). This
     // keeps the user-facing picker simple while preserving the bench harness.
     private val debugInt8Out = File(modelDir, "force_fp16_lm.txt").exists()   // opt-out int8
@@ -127,13 +127,13 @@ class PocketTtsSynthesizer(
     private val forceInt8Dec = File(modelDir, "force_int8_dec.txt").exists()
     private val forceFp32Dec = File(modelDir, "force_fp32_dec.txt").exists()
 
-    // Engine → default set:
+    // Profile → default set:
     //   STANDARD: int8w LM/dectx + fp32-deconly, lm+dectx CPU, dec CPU.
     //   STUDIO  : all-fp32 (LM fp32, dectx fp16, deconly fp32), all CPU.
     //   FAST    : int8w LM/dectx + int8-deconly on GPU, lm/dectx CPU.
-    private val engineInt8 = engine == Engine.STANDARD || engine == Engine.FAST
-    private val engineAllFp32 = engine == Engine.STUDIO
-    private val engineDecGpu = engine == Engine.FAST
+    private val engineInt8 = engine == Profile.CPU_INT8W || engine == Profile.HYBRID
+    private val engineAllFp32 = engine == Profile.CPU_FP32
+    private val engineDecGpu = engine == Profile.HYBRID
 
     // final graph choice, debug files override engine
     private val int8 = if (debugInt8Out) false else engineInt8
@@ -287,7 +287,7 @@ class PocketTtsSynthesizer(
         // engine — only FAST's decoder, or an explicit force-file GPU request,
         // uses the GPU. (int8-on-GPU and fp16-compute both have known Adreno
         // issues; CPU is the universal path.)
-        if (key in forceCpu || ((int8 || allFp32 || engine == Engine.STUDIO) && !gpuRequested && !decGpuForEngine)) {
+        if (key in forceCpu || ((int8 || allFp32 || engine == Profile.CPU_FP32) && !gpuRequested && !decGpuForEngine)) {
             return CompiledModel.create(p, cpuOpts(), null) to "CPU*"
         }
         // eps override applies to the fp16 LM graph only (see force_eps.txt).
@@ -665,16 +665,17 @@ class PocketTtsSynthesizer(
     }
 }
 
-/** The three user-facing configs (everything else is a debug override):
- *   STANDARD — int8w LM/dectx + fp32-deconly, all CPU. Universal, GPU-free,
- *              clean, RTF ~0.9. (the default)
- *   STUDIO   — all-fp32 ("no quantization anywhere"), all CPU, max quality,
- *              RTF ~1.1.
- *   FAST     — int8w LM/dectx on CPU + int8 decoder on GPU, RTF ~0.3; needs a
- *              working GPU, falls back to STANDARD on failure.
+/** The three user-facing placement profiles (everything else is a debug
+ *   override):
+ *   CPU_INT8W — int8w LM/dectx + fp32-deconly, all CPU. Universal, GPU-free,
+ *               clean, RTF ~0.9. (the default)
+ *   CPU_FP32  — all-fp32 ("no quantization anywhere"), all CPU, max quality,
+ *               RTF ~1.1.
+ *   HYBRID    — int8w LM/dectx on CPU + int8 decoder on GPU, RTF ~0.3; only
+ *               offered when a working GPU is detected, falls back to CPU.
  */
-enum class Engine(val label: String) {
-    STANDARD("Standard"),
-    STUDIO("Studio"),
-    FAST("Fast"),
+enum class Profile(val label: String) {
+    CPU_INT8W("CPU (int8w/fp32)"),
+    CPU_FP32("CPU (FP32)"),
+    HYBRID("Hybrid (CPU+GPU)"),
 }

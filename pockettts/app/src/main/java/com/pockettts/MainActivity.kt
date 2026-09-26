@@ -29,26 +29,32 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var input: EditText
     private lateinit var voices: Spinner
-    private lateinit var engines: Spinner
+    private lateinit var profiles: Spinner
     private lateinit var button: Button
     private lateinit var waveform: WaveformView
 
-    private fun selectedEngine(): Engine =
-        Engine.entries.getOrElse(
-            engines.selectedItemPosition, { Engine.STANDARD })
+    private fun gpuAvailable(): Boolean =
+        try {
+            val env = com.google.ai.edge.litert.Environment.create(this)
+            env.getAvailableAccelerators().contains(com.google.ai.edge.litert.Accelerator.GPU)
+        } catch (e: Throwable) { false }
 
-    /** Rebuild the synthesizer for the currently selected engine (spinner change
-     * OR initial load). Runs on the background thread; disabled button during. */
+    private fun selectedProfile(): Profile =
+        Profile.entries.getOrElse(
+            profiles.selectedItemPosition, { Profile.CPU_INT8W })
+
+    /** Rebuild the synthesizer for the currently selected profile (spinner
+     * change OR initial load). Runs on the background thread. */
     private fun rebuildSynth() {
-        if (!::engines.isInitialized) return
+        if (!::profiles.isInitialized) return
         runOnUiThread {
             button.isEnabled = false
-            status.text = "Loading ${selectedEngine().label}…"
+            status.text = "Loading ${selectedProfile().label}…"
         }
         bg.execute {
             synth?.close()
             synth = try {
-                PocketTtsSynthesizer(this, selectedEngine())
+                PocketTtsSynthesizer(this, selectedProfile())
             } catch (e: Throwable) {
                 android.util.Log.e("PocketTTS", "load failed", e)
                 runOnUiThread { status.text = "Load failed: ${e.message}" }
@@ -89,18 +95,39 @@ class MainActivity : Activity() {
                 PocketTtsSynthesizer.VOICES,
             )
         }
-        engines = Spinner(this).apply {
-            adapter = ArrayAdapter(
-                this@MainActivity,
-                android.R.layout.simple_spinner_dropdown_item,
-                Engine.entries.map { it.label },
-            )
-            setSelection(0) // Standard (default)
+        val gpuOk = gpuAvailable()
+        profiles = Spinner(this).apply {
+            // All three profiles shown; Hybrid greys out when no GPU is present.
+            // isEnabled / getDropDownView drive the grey-out + non-selectable row.
+            adapter = object : ArrayAdapter<Profile>(
+                this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
+                Profile.entries,
+            ) {
+                override fun isEnabled(position: Int): Boolean {
+                    val p = getItem(position)
+                    return p != Profile.HYBRID || gpuOk
+                }
+                override fun getDropDownView(
+                    position: Int, convertView: android.view.View?,
+                    parent: android.view.ViewGroup?,
+                ): android.view.View {
+                    val v = super.getDropDownView(position, convertView, parent)
+                    v.isEnabled = isEnabled(position)
+                    v.alpha = if (isEnabled(position)) 1f else 0.4f
+                    return v
+                }
+            }
+            setSelection(0) // CPU (int8w/fp32) default
             onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
                 override fun onItemSelected(
                     parent: android.widget.AdapterView<*>?, v: android.view.View?,
                     pos: Int, id: Long,
-                ) { rebuildSynth() }
+                ) {
+                    if (getItemAtPosition(pos) == Profile.HYBRID && !gpuOk) {
+                        setSelection(0)
+                        status.text = "Hybrid needs a GPU; using CPU (int8w/fp32)."
+                    } else rebuildSynth()
+                }
                 override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
             }
         }
@@ -108,7 +135,7 @@ class MainActivity : Activity() {
         status = TextView(this).apply { text = "Loading model…"; textSize = 14f }
         waveform = WaveformView(this)
         val topMargins = intArrayOf(0, 24, 32, 24, 24)
-        for ((index, view) in listOf(input, voices, engines, button, status).withIndex()) {
+        for ((index, view) in listOf(input, voices, profiles, button, status).withIndex()) {
             val params = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
             params.topMargin = topMargins[index]
@@ -160,9 +187,9 @@ class MainActivity : Activity() {
             val idx = PocketTtsSynthesizer.VOICES.indexOf(v)
             if (idx >= 0) voices.setSelection(idx)
         }
-        i.getStringExtra("engine")?.let { e ->
-            val idx = Engine.entries.indexOfFirst { it.name.equals(e, true) }
-            if (idx >= 0) engines.setSelection(idx)
+        i.getStringExtra("profile")?.let { e ->
+            val idx = Profile.entries.indexOfFirst { it.name.equals(e, true) }
+            if (idx >= 0) profiles.setSelection(idx)
         }
         if (button.isEnabled) button.performClick()
     }
