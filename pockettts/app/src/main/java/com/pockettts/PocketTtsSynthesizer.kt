@@ -127,6 +127,14 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
     // noise" (VibeVoice #64) — flip dec graph+placement while LM/dectx stay
     // int8-CPU and compare the silence.
     private val fp16dec = File(modelDir, "force_fp16_dec.txt").exists()
+    // `force_int8_dec.txt` -> force the decoder to the int8 SEANet graph.
+    // Default (below) already uses int8 deconly when the decoder runs on the
+    // GPU (clean + fast, "int8 LM-CPU / dec-GPU"); this knob also allows it
+    // on CPU even though that hisses. fp16 deconly is clean and ~1.7x the
+    // int8 speed, which is why the CPU case falls back to fp16 (see below).
+    // The old "fp16 deconly on CPU = 169 s/unusable" was the single-threaded
+    // build; with cpuOpts() threads it is RTF ~0.8-0.9.
+    private val int8dec = File(modelDir, "force_int8_dec.txt").exists() && !fp16dec
     // `force_fp32_dec.txt` -> decoder uses the full-fp32 graph. Test: does
     // fp32 SEANet on CPU avoid the residual-stream static entirely?
     private val fp32dec = File(modelDir, "force_fp32_dec.txt").exists()
@@ -137,10 +145,19 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
             else -> LM
         }
     private val decTxPath = if (int8) "pt_mimi_dec_tx_int8.tflite" else DEC_TX
+    // int8-deconly hisses on CPU (11 int8 conv weights, scales up to 1.3e-2,
+    // kept at int8 by XNNPACK); fp16-deconly on CPU is clean at RTF ~0.8-0.9.
+    // Placement-aware default:
+    //   dec forced to CPU -> fp16 deconly (clean);
+    //   dec on GPU -> int8 deconly (clean + fast, RTF ~0.27);
+    //   force_fp16_dec / force_int8_dec / force_fp32_dec override explicitly.
+    private val decOnCpu = "dec" in forceCpu
     private val deconlyPath =
         when {
             fp32dec -> "pt_mimi_deconly.tflite"
-            int8 && !fp16dec -> "pt_mimi_deconly_int8.tflite"
+            int8dec -> "pt_mimi_deconly_int8.tflite"
+            int8 && decOnCpu -> DECONLY                 // CPU fallback: fp16 (clean)
+            int8 -> "pt_mimi_deconly_int8.tflite"       // GPU case: int8 (fast+clean)
             else -> DECONLY
         }
 
