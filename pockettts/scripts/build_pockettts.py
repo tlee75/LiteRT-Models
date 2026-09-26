@@ -129,6 +129,34 @@ def to_fp16(fp32_path, fp16_path):
     return fp16_path
 
 
+def to_int8(fp32_path, int8_path, rep_inputs=None):
+    """int8 WEIGHT quantization (dynamic range) via ai-edge-quantizer.
+
+    Weight-only/dynamic: weights quantized to int8, activations stay fp32, I/O
+    stays fp32 — matching ONNX DynamicQuantizeLinear int8 (what the web bench
+    wasm path used) and, critically, keeping the flow-LM's host-resident fp32
+    KV cache / rope / mask contract intact (a full int8xint8 graph turns KV to
+    int8, which the host state machine cannot service).
+
+    `rep_inputs` is unused in the dynamic path (no activation calibration
+    needed) but accepted for API stability.
+    """
+    from ai_edge_quantizer import quantizer, recipe_manager
+    from ai_edge_quantizer.qtyping import TensorQuantizationConfig
+    from ai_edge_quantizer.recipe import AlgorithmName, qtyping
+    rm = recipe_manager.RecipeManager()
+    rm.add_dynamic_config(
+        regex=".*", operation_name=qtyping.TFLOperationName.ALL_SUPPORTED,
+        num_bits=8, algorithm_key=AlgorithmName.MIN_MAX_UNIFORM_QUANT)
+    if os.path.exists(int8_path):
+        os.remove(int8_path)
+    qt = quantizer.Quantizer(float_model=fp32_path)
+    qt.load_quantization_recipe(rm.get_quantization_recipe())
+    qt.quantize().export_model(int8_path)
+    print(f"exported {int8_path} ({os.path.getsize(int8_path)/1e6:.1f} MB)")
+    return int8_path
+
+
 def opcheck(path, label):
     import collections
     from ai_edge_litert.interpreter import Interpreter
@@ -142,6 +170,42 @@ def opcheck(path, label):
           f"size {os.path.getsize(path)/1e6:.1f}MB "
           f"VERDICT: {'GPU-CLEAN' if not bad and not over else 'BLOCKERS'}")
     return not bad and not over
+
+
+def write_eps_sidecar(fp16_path, eps=1e-5):
+    """Record where the LayerNorm eps scalar lives inside the tflite flatbuffer.
+
+    The 13 fused flow-LM LayerNorms all read ONE shared [1,1,1] FLOAT32 constant
+    (var + eps -> rsqrt). The app can patch those 4 bytes in memory to switch the
+    eps at load time (fp16-safe 2^-14 protects subnormal-flushing GPUs) without
+    shipping copies of the 169 MB graph. Write a tiny sidecar holding the byte
+    offset of that constant so the app doesn't hardcode the flatbuffer layout.
+    """
+    from ai_edge_litert import schema_py_generated as tfl
+    raw = open(fp16_path, "rb").read()
+    m = tfl.Model.GetRootAs(memoryview(raw))
+    sg = m.Subgraphs(0)
+    for i in range(sg.TensorsLength()):
+        t = sg.Tensors(i)
+        # scalar fp32 constant with the eps value, single shared buffer
+        if t.Type() == 0 and t.ShapeLength() and list(t.ShapeAsNumpy()) == [1, 1, 1]:
+            b = m.Buffers(t.Buffer())
+            col = b.DataLength()
+            if col != 4:
+                continue
+            vec = b.Data(0)
+            tab = b._tab
+            o = tab.Offset(4)
+            data_pos = tab.Vector(o)
+            import struct
+            val = struct.unpack("<f", raw[data_pos:data_pos + 4])[0]
+            if abs(val - eps) < 1e-8:
+                side = fp16_path + ".eps_offset"
+                with open(side, "w") as f:
+                    f.write(f"{data_pos}\t{t.Buffer()}\t{tab.Pos}\t{val}\n")
+                print(f"eps sidecar -> {side}: pos={data_pos} buffer={t.Buffer()} val={val}")
+                return data_pos, t.Buffer()
+    raise RuntimeError(f"no shared eps constant {eps} found in {fp16_path}")
 
 
 class CM:
@@ -442,6 +506,24 @@ def stage_fused(model):
     opcheck(p, "flowlm_fused")
     to_fp16(p, os.path.join(OUT, "pt_flowlm_fused_fp16.tflite"))
     opcheck(os.path.join(OUT, "pt_flowlm_fused_fp16.tflite"), "flowlm_fused_fp16")
+    write_eps_sidecar(os.path.join(OUT, "pt_flowlm_fused_fp16.tflite"), eps=1e-5)
+    # Int8 needs activation calibration; feed real one-step inputs (the same
+    # tensors the parity check below consumes). A handful of varied samples.
+    def _rep_inputs():
+        import numpy as _np
+        for pos in range(off0, min(off0 + 12, PMAX - 1)):
+            c, s = rope_cos_sin_deint(pos)
+            yield {
+                "args_0": bos_in.view(1, 1, -1).numpy(),
+                "args_1": c.reshape(1, 1, 1, HD),
+                "args_2": s.reshape(1, 1, 1, HD),
+                "args_3": make_mask(pos),
+                "args_4": pk.numpy(),
+                "args_5": pv.numpy(),
+                "args_6": noises[pos % len(noises)].numpy(),
+            }
+    to_int8(p, os.path.join(OUT, "pt_flowlm_fused_int8.tflite"), rep_inputs=_rep_inputs())
+    opcheck(os.path.join(OUT, "pt_flowlm_fused_int8.tflite"), "flowlm_fused_int8")
 
     cm = CM(p)
     c, s = rope_cos_sin_deint(off0)
@@ -454,6 +536,18 @@ def stage_fused(model):
               noises[0].numpy())
     print(f"tflite fused one-step corr {corr(outs[0], ref.numpy()):.6f} "
           f"max|d| {maxd(outs[0], ref.numpy()):.2e}")
+
+    # int8 one-step parity vs eager (quality check; the model is flow-matching,
+    # so one-step diff is the right proxy for audible correctness)
+    try:
+        cm8 = CM(os.path.join(OUT, "pt_flowlm_fused_int8.tflite"))
+        outs8 = cm8(bos_in.view(1, 1, -1).numpy(), c.reshape(1, 1, 1, HD),
+                    s.reshape(1, 1, 1, HD), make_mask(off0), pk.numpy(),
+                    pv.numpy(), noises[0].numpy())
+        print(f"int8 fused one-step corr {corr(outs8[0], ref.numpy()):.6f} "
+              f"max|d| {maxd(outs8[0], ref.numpy()):.2e}")
+    except Exception as e:
+        print(f"int8 one-step parity FAILED: {e}")
 
 
 G_KV = N_LAYERS * N_HEADS * HD
@@ -898,6 +992,8 @@ def stage_dectx(model):
     p = convert(g, (torch.zeros(1, 1 + F_BLK, LDIM),), os.path.join(OUT, "pt_mimi_dec_tx.tflite"))
     opcheck(p, "dec_tx")
     to_fp16(p, os.path.join(OUT, "pt_mimi_dec_tx_fp16.tflite"))
+    to_int8(p, os.path.join(OUT, "pt_mimi_dec_tx_int8.tflite"))
+    opcheck(os.path.join(OUT, "pt_mimi_dec_tx_int8.tflite"), "dec_tx_int8")
     cm = CM(p)
     blk = neutral.view(1, 1, LDIM).repeat(1, 1 + F_BLK, 1).clone()
     blk[0, 1:1 + min(F_BLK, T)] = lat[0, :min(F_BLK, T)]
@@ -958,6 +1054,8 @@ def stage_deconly(model):
     p = convert(g, (torch.zeros(1, MIMI_D, S_DEC),), os.path.join(OUT, "pt_mimi_deconly.tflite"))
     opcheck(p, "deconly")
     to_fp16(p, os.path.join(OUT, "pt_mimi_deconly_fp16.tflite"))
+    to_int8(p, os.path.join(OUT, "pt_mimi_deconly_int8.tflite"))
+    opcheck(os.path.join(OUT, "pt_mimi_deconly_int8.tflite"), "deconly_int8")
     return g
 
 

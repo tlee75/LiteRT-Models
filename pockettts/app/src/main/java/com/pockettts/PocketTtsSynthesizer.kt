@@ -111,23 +111,181 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
     private val forceCpu = overrideSet("force_cpu.txt")
     private val forceFp32 = overrideSet("force_fp32.txt")
 
+    // Keys that use force_gpu_opts.txt (normally just the LM).
+    private val forceGpuOpts = overrideSet("force_gpu_opts_keys.txt")
+
+    // `force_int8_lm.txt` present -> use *_int8.tflite graphs for LM + Mimi
+    // instead of the fp16 files. The int8 graphs keep fp32 I/O so the host KV
+    // contract is unchanged; used for CPU-only benchmarks.
+    private val int8 = File(modelDir, "force_int8_lm.txt").exists()
+    // `force_fp32_graph.txt` -> LM uses the full-fp32 graph (fp32 weights) for
+    // speed comparisons vs the fp16-weight graph at FP32 compute (GPU32).
+    private val fp32graph = File(modelDir, "force_fp32_graph.txt").exists()
+    // `force_fp16_dec.txt` -> decoder (deconly) uses the fp16 graph even when
+    // the LM/dectx are int8. Isolates the SEANet CPU-noise floor question:
+    // "android XNNPACK computes native fp16 and collapses residual streams to
+    // noise" (VibeVoice #64) — flip dec graph+placement while LM/dectx stay
+    // int8-CPU and compare the silence.
+    private val fp16dec = File(modelDir, "force_fp16_dec.txt").exists()
+    // `force_fp32_dec.txt` -> decoder uses the full-fp32 graph. Test: does
+    // fp32 SEANet on CPU avoid the residual-stream static entirely?
+    private val fp32dec = File(modelDir, "force_fp32_dec.txt").exists()
+    private val lmPath =
+        when {
+            int8 -> "pt_flowlm_fused_int8.tflite"
+            fp32graph -> "pt_flowlm_fused.tflite"
+            else -> LM
+        }
+    private val decTxPath = if (int8) "pt_mimi_dec_tx_int8.tflite" else DEC_TX
+    private val deconlyPath =
+        when {
+            fp32dec -> "pt_mimi_deconly.tflite"
+            int8 && !fp16dec -> "pt_mimi_deconly_int8.tflite"
+            else -> DECONLY
+        }
+
+    // `force_dbg.txt` present -> per-step timing + latent/eos dumps. Independent
+    // of which graph file is loaded (fp16/int8, GPU/CPU). Debug only.
+    private val dbg = File(modelDir, "force_dbg.txt").exists()
+
+    // `force_noise0.txt` present -> generation feeds ZERO noise (even with
+    // TEMP>0). Discriminates whether the GPU fp16 NaN (seen at the first
+    // generation frame, f=10) originates in the flow-HEAD's noise path
+    // (clean when zeroed) or in the transformer body (still NaN when zeroed).
+    private val noise0 = File(modelDir, "force_noise0.txt").exists()
+
+    // `force_eps.txt` present -> in-memory override of the flow-LM LayerNorm
+    // eps constant (float) before the graph is handed to the delegate. The
+    // packed-LM keeps ALL 13 LayerNorms on ONE shared [1,1,1] fp32 constant
+    // (`var + eps -> rsqrt`), and build_pockettts.py writes a sidecar
+    // (`*.eps_offset`) with its flatbuffer byte offset. Default baked eps is
+    // 1e-5 (subnormal in fp16); a subnormal-flushing GPU (Adreno) flushes it
+    // to 0 -> rsqrt(0) -> NaN. fp16-safe values are >= 6.1e-5 (2^-14).
+    // This patches the fp16 LM graph only; no rebuild / no duplicate graphs.
+    private val forceEps: Float? =
+        File(modelDir, "force_eps.txt").takeIf { it.exists() }?.readText()
+            ?.trim()?.toFloatOrNull()
+
+    private fun optTag(): String {
+        val o = gpuOverrides()
+        return "p=${o.precision?.name ?: "default"} b=${o.backend?.name ?: "auto"} " +
+            "pl=${o.allowSrcQuantizedFcConvOps} tw=${o.preferTextureWeights} " +
+            "cs=${o.constantTensorSharing} ic=${o.infiniteFloatCapping}"
+    }
+
+    // `force_gpu_opts.txt`: comma-separated overrides for LM GPU options,
+    // for fp16-LM debugging on Adreno (none of these are the app default).
+    // keys: precision=default|fp16|fp32, backend=automatic|opencl|webgpu|opengl,
+    //       prec_loss=true|false, tex_weights=true|false, const_share=true|false,
+    //       cap_ifinite=true|false
+    private fun gpuOverrides(): CompiledModel.GpuOptions {
+        val f = File(modelDir, "force_gpu_opts.txt").takeIf { it.exists() }
+            ?.readText()?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() } ?: return CompiledModel.GpuOptions()
+        var precision = CompiledModel.GpuOptions.Precision.DEFAULT
+        var backend = CompiledModel.GpuOptions.Backend.AUTOMATIC
+        var precLoss: Boolean? = null; var texW: Boolean? = null
+        var constS: Boolean? = null; var capInf: Boolean? = null
+        for (kv in f) {
+            val parts = kv.split('=', limit = 2)
+            if (parts.size < 2) continue
+            val (k, v) = parts[0] to parts[1]
+            when (k) {
+                "precision" -> precision = when (v.lowercase()) {
+                    "fp16" -> CompiledModel.GpuOptions.Precision.FP16
+                    "fp32" -> CompiledModel.GpuOptions.Precision.FP32
+                    else -> CompiledModel.GpuOptions.Precision.DEFAULT
+                }
+                "backend" -> backend = when (v.lowercase()) {
+                    "opencl" -> CompiledModel.GpuOptions.Backend.OPENCL
+                    "webgpu" -> CompiledModel.GpuOptions.Backend.WEBGPU
+                    "opengl" -> CompiledModel.GpuOptions.Backend.OPENGL
+                    else -> CompiledModel.GpuOptions.Backend.AUTOMATIC
+                }
+                "prec_loss" -> precLoss = v.toBoolean()
+                "tex_weights" -> texW = v.toBoolean()
+                "const_share" -> constS = v.toBoolean()
+                "cap_ifinite" -> capInf = v.toBoolean()
+            }
+        }
+        return CompiledModel.GpuOptions(
+            constantTensorSharing = constS,
+            infiniteFloatCapping = capInf,
+            allowSrcQuantizedFcConvOps = null,
+            precision = precision,
+            bufferStorageType = null,
+            preferTextureWeights = texW,
+            serializationDir = null,
+            modelCacheKey = null,
+            serializeProgramCache = null,
+            serializeExternalTensors = null,
+            externalTensorsMode = null,
+            externalTensorPattern = null,
+            backend = backend,
+            priority = null,
+            numStepsOfCommandBufferPreparations = null,
+        )
+    }
+
+    // CPU delegate options: the default is a single thread, which makes the
+    // CPU path ~5x slower than it should be (the web bench's threaded wasm at
+    // ~1.0 RTF). Use all available cores. Harmless on GPU builds (CPU only
+    // used when force_cpu / fallback).
+    private fun cpuOpts(): CompiledModel.Options {
+        val opts = CompiledModel.Options(Accelerator.CPU)
+        opts.cpuOptions =
+            CompiledModel.CpuOptions(numThreads = Runtime.getRuntime().availableProcessors())
+        return opts
+    }
+
+    // Temporary patched-graph copies (avoided unless force_eps.txt present).
+    private val tempModels = ArrayList<File>()
+
+    /** Patch the shared LayerNorm eps constant of `fp16Tflite` to [eps]. */
+    private fun patchEps(fp16Tflite: File, eps: Float): File {
+        val side = File(fp16Tflite.absolutePath + ".eps_offset")
+        check(side.exists()) { "missing eps sidecar $side (rebuild with build_pockettts.py)" }
+        val pos = side.readText().trim().split('\t').first().toInt()
+        val data = RandomAccessFile(fp16Tflite, "r").use { f ->
+            val b = ByteArray(f.length().toInt()); f.readFully(b); b
+        }
+        // little-endian float32 write in place
+        val bits = java.lang.Float.floatToRawIntBits(eps)
+        data[pos + 0] = (bits and 0xFF).toByte()
+        data[pos + 1] = ((bits shr 8) and 0xFF).toByte()
+        data[pos + 2] = ((bits shr 16) and 0xFF).toByte()
+        data[pos + 3] = ((bits shr 24) and 0xFF).toByte()
+        val tmp = File(modelDir, "pt_flowlm_fused_fp16_eps${eps}.tflite")
+        RandomAccessFile(tmp, "rw").use { f -> f.write(data) }
+        tempModels.add(tmp)
+        return tmp
+    }
+
     /** Compile on GPU; fall back to CPU (fp16 weights dequantize to fp32 there). */
     private fun load(name: String, key: String): Pair<CompiledModel, String> {
         val p = path(name).absolutePath
         if (key in forceCpu) {
-            return CompiledModel.create(p, CompiledModel.Options(Accelerator.CPU), null) to "CPU*"
+            return CompiledModel.create(p, cpuOpts(), null) to "CPU*"
         }
+        // eps override applies to the fp16 LM graph only (see force_eps.txt).
+        val graphPath =
+            if (key == "lm" && forceEps != null && name.endsWith("_fp16.tflite")) {
+                patchEps(path(name), forceEps).absolutePath
+            } else p
         return try {
             if (key in forceFp32) {
                 val opts = CompiledModel.Options(Accelerator.GPU)
                 opts.gpuOptions =
                     CompiledModel.GpuOptions(precision = CompiledModel.GpuOptions.Precision.FP32)
-                CompiledModel.create(p, opts, null) to "GPU32"
+                CompiledModel.create(graphPath, opts, null) to "GPU32"
+            } else if (key in forceGpuOpts) {
+                val opts = CompiledModel.Options(Accelerator.GPU)
+                opts.gpuOptions = gpuOverrides()
+                CompiledModel.create(graphPath, opts, null) to "GPU:${optTag()}"
             } else {
-                CompiledModel.create(p, CompiledModel.Options(Accelerator.GPU), null) to "GPU"
+                CompiledModel.create(graphPath, CompiledModel.Options(Accelerator.GPU), null) to "GPU"
             }
         } catch (e: Throwable) {
-            CompiledModel.create(p, CompiledModel.Options(Accelerator.CPU), null) to "CPU"
+            CompiledModel.create(p, cpuOpts(), null) to "CPU"
         }
     }
 
@@ -140,12 +298,12 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
     // `force_gpu.txt` with "dectx" re-enables GPU for experiments.
     private val forceGpu = overrideSet("force_gpu.txt")
 
-    private val lmP = load(LM, "lm")
+    private val lmP = load(lmPath, "lm")
     private val dectxP =
-        if ("dectx" in forceGpu) load(DEC_TX, "dectx")
+        if ("dectx" in forceGpu) load(decTxPath, "dectx")
         else CompiledModel.create(
-            path(DEC_TX).absolutePath, CompiledModel.Options(Accelerator.CPU), null) to "CPU"
-    private val deconlyP = load(DECONLY, "dec")
+            path(decTxPath).absolutePath, cpuOpts(), null) to "CPU"
+    private val deconlyP = load(deconlyPath, "dec")
     private val lm = lmP.first
     private val dectx = dectxP.first
     private val deconly = deconlyP.first
@@ -260,9 +418,15 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
      * Returns (latent, eosLogit) and appends this step's K/V at [pos].
      * Text prompting passes zero noise and ignores the latent.
      */
+    // -- per-phase timing + latent dumps (only when force_dbg.txt present)
+    private val tSetup = java.util.concurrent.atomic.AtomicLong(0)  // host prep
+    private val tRun = java.util.concurrent.atomic.AtomicLong(0)    // lm.run
+    private val tRead = java.util.concurrent.atomic.AtomicLong(0)   // readFloat
     private fun step(emb: FloatArray, noise: FloatArray): Pair<FloatArray, Float> {
         check(pos < PMAX) { "KV cache overflow at $pos" }
+        val p0 = if (dbg) System.nanoTime() else 0L
         ropeFill(pos)
+        val p1 = if (dbg) System.nanoTime() else 0L
         lmIn[0].writeFloat(emb)
         lmIn[1].writeFloat(cosArr)
         lmIn[2].writeFloat(sinArr)
@@ -270,10 +434,28 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
         lmIn[4].writeFloat(pk)
         lmIn[5].writeFloat(pv)
         lmIn[6].writeFloat(noise)
+        val p2 = if (dbg) System.nanoTime() else 0L
         lm.run(lmIn, lmOut)
+        val p3 = if (dbg) System.nanoTime() else 0L
         val out = lmOut[0].readFloat()
+        val p4 = if (dbg) System.nanoTime() else 0L
+        if (dbg) {
+            tSetup.addAndGet(p1 - p0 + p2 - p1)
+            tRun.addAndGet(p3 - p2)
+            tRead.addAndGet(p4 - p3)
+        }
         val eos = out[0]
         val latent = out.copyOfRange(1, 1 + LDIM)
+        if (dbg && (pos - voiceLen < 16)) {
+            android.util.Log.i("PocketTTS",
+                "dbg f=${pos - voiceLen} eos=$eos lat0=${latent[0]} lat1=${latent[1]} lat15=${latent[15]} lat31=${latent[31]} " +
+                "latAbsMean=${latent.average()} latStd=${kotlin.math.sqrt(latent.map { it * it }.average())}")
+            // also the raw output block (excluding the 6144*2 KV tail) to catch the
+            // first NaN-bearing region precisely
+            val nz = out.take(minOf(out.size, 1 + LDIM + 64)).filter { it.isNaN() }.size
+            if (nz > 0) android.util.Log.i("PocketTTS", "dbg f=${pos - voiceLen} NaNcount(in front)=$nz firstNaNidx=" +
+                out.take(1 + LDIM + 64).indexOfFirst { it.isNaN() })
+        }
         val kvBase = 1 + LDIM
         for (g in 0 until G) {
             System.arraycopy(out, kvBase + g * HD, pk, g * PMAX * HD + pos * HD, HD)
@@ -306,6 +488,10 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
         val out = FloatArray(total)
         var o = 0
         for (a in audio) { System.arraycopy(a, 0, out, o, a.size); o += a.size }
+        if (dbg) {
+            android.util.Log.i("PocketTTS",
+                "steps: setup=${tSetup.get()/1e6}ms run=${tRun.get()/1e6}ms read=${tRead.get()/1e6}ms tot=${(System.nanoTime()-t0)/1e6}ms")
+        }
         return Result(out, frames, (System.nanoTime() - t0) / 1_000_000)
     }
 
@@ -319,9 +505,15 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
         var emb = bosInput
         var eosStep = -1
         for (g in 0 until maxGen) {
-            val noise = FloatArray(LDIM) {
-                (rnd.nextGaussian() * sqrt(TEMP.toDouble())).toFloat()
-            }
+            // force_noise0.txt: feed ZERO noise even at generation. If the GPU
+            // fp16 NaN disappears with zeroed noise but returns with real
+            // noise, the fault is in the flow-HEAD's noise path; if it NaNs
+            // either way, it is in the transformer body.
+            val noise =
+                if (noise0) zeroNoise
+                else FloatArray(LDIM) {
+                    (rnd.nextGaussian() * sqrt(TEMP.toDouble())).toFloat()
+                }
             val (lat, eosLogit) = step(emb, noise)
             if (eosLogit > EOS_THRESHOLD && eosStep < 0) eosStep = g
             if (eosStep >= 0 && g >= eosStep + framesAfterEos) break
@@ -438,6 +630,8 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
         listOf(lmIn, lmOut, dectxIn, dectxOut, deconlyIn, deconlyOut)
             .forEach { l -> l.forEach { it.close() } }
         lm.close(); dectx.close(); deconly.close(); embChannel.close()
+        tempModels.forEach { it.delete() }
+        tempModels.clear()
     }
 
     private fun readF32(f: File): FloatArray {
