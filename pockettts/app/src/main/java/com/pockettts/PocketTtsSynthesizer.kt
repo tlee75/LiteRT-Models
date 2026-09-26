@@ -403,6 +403,12 @@ class PocketTtsSynthesizer(
     /** Load a repacked voice state: int32 T, then k and v as fp16 `[96][T][64]`. */
     fun loadVoice(name: String) {
         if (name == voiceName) return
+        if (name == "custom") {
+            val f = File(modelDir, "pt_voice_custom.bin")
+            check(f.exists()) {
+                "No cloned voice yet — pick a reference with the ➕ Clone entry first"
+            }
+        }
         val bb = ByteBuffer.wrap(path("pt_voice_$name.bin").readBytes())
             .order(ByteOrder.LITTLE_ENDIAN)
         val t = bb.int
@@ -466,7 +472,20 @@ class PocketTtsSynthesizer(
             System.arraycopy(pv, g * PMAX * HD, v, g * t * HD, t * HD)
         }
         voiceK = k; voiceV = v; voiceLen = t; voiceName = "custom"
+        // Persist the clone in the preset format so it survives a profile
+        // switch / app restart (each will construct a fresh synthesizer that
+        // loads "custom" from this file like any preset voice).
+        saveVoiceState("custom", k, v, t)
         return t
+    }
+
+    /** Write a voice state as int32 T + fp16 k/v [96][T][64] (preset format). */
+    private fun saveVoiceState(name: String, k: FloatArray, v: FloatArray, t: Int) {
+        val bb = ByteBuffer.allocate(4 + (k.size + v.size) * 2).order(ByteOrder.LITTLE_ENDIAN)
+        bb.putInt(t)
+        for (x in k) bb.putShort(Half.toHalf(x))
+        for (x in v) bb.putShort(Half.toHalf(x))
+        File(modelDir, "pt_voice_$name.bin").writeBytes(bb.array())
     }
 
     /** Snapshot-equivalent of resetToVoice with an EMPTY voice (pos starts at 0). */

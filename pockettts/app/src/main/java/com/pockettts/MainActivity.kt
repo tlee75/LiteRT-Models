@@ -50,6 +50,9 @@ class MainActivity : Activity() {
     // Last generated audio (replayable via Play).
     private var lastAudio: FloatArray = FloatArray(0)
 
+    // Active playback; Play toggles to Stop while a track is live.
+    private var track: AudioTrack? = null
+
     private fun gpuAvailable(): Boolean =
         try {
             val env = com.google.ai.edge.litert.Environment.create(this)
@@ -228,6 +231,7 @@ class MainActivity : Activity() {
                         status.text = line
                         generate.isEnabled = true
                         play.isEnabled = true
+                        autoplay()
                     }
                 } catch (e: Throwable) {
                     android.util.Log.e("PocketTTS", "generation failed", e)
@@ -236,12 +240,31 @@ class MainActivity : Activity() {
             }
         }
 
-        // Separate Play button: enabled after generate (or clone preview), can
-        // be tapped repeatedly to re-hear the last output.
+        // Play/Stop toggle: enabled after generate (or clone preview), tap
+        // replays the last output, tap again stops playing.
         play.setOnClickListener {
-            val audio = lastAudio
-            if (audio.isNotEmpty()) playAudio(audio)
+            if (track != null) stopAudio()
+            else {
+                val audio = lastAudio
+                if (audio.isNotEmpty()) playAudio(audio)
+            }
         }
+    }
+
+    /** Stop the live AudioTrack if any and reset the button. */
+    private fun stopAudio() {
+        track?.let {
+            it.pause()
+            it.flush()
+            it.release()
+        }
+        track = null
+        play.text = "Play"
+    }
+
+    private fun autoplay() {
+        val audio = lastAudio
+        if (audio.isNotEmpty()) playAudio(audio)
     }
 
     private fun openClonePicker() {
@@ -514,10 +537,11 @@ class MainActivity : Activity() {
     }
 
     /** Play `audio`; the waveform starts exactly when audio starts. Replay-safe:
-     *  each tap creates a fresh AudioTrack, so re-tapping just replays. */
+     *  the Play button toggles to Stop while playing; tapping again stops. */
     private fun playAudio(audio: FloatArray) {
         if (audio.isEmpty()) return
-        val track = AudioTrack(
+        stopAudio()
+        val t = AudioTrack(
             AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).build(),
             AudioFormat.Builder()
                 .setSampleRate(PocketTtsSynthesizer.SAMPLE_RATE)
@@ -526,11 +550,17 @@ class MainActivity : Activity() {
                 .build(),
             audio.size * 4, AudioTrack.MODE_STATIC, AudioManager.AUDIO_SESSION_ID_GENERATE,
         )
-        track.write(audio, 0, audio.size, AudioTrack.WRITE_BLOCKING)
-        track.play()
+        t.write(audio, 0, audio.size, AudioTrack.WRITE_BLOCKING)
+        t.play()
+        track = t
+        play.text = "Stop"
         runOnUiThread { waveform.start(audio, PocketTtsSynthesizer.SAMPLE_RATE) }
-        Thread { Thread.sleep((audio.size * 1000L / PocketTtsSynthesizer.SAMPLE_RATE) + 250); track.release() }
-            .start()
+        Thread {
+            Thread.sleep((audio.size * 1000L / PocketTtsSynthesizer.SAMPLE_RATE) + 250)
+            // reset to "Play" only if this is still the live track
+            runOnUiThread { if (track === t) { track = null; play.text = "Play" } }
+            t.release()
+        }.start()
     }
 
     override fun onDestroy() {
