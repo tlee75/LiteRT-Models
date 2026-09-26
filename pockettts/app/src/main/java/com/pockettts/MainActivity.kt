@@ -1,11 +1,14 @@
 package com.pockettts
 
 import android.app.Activity
+import android.content.Intent
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import android.net.Uri
 import android.os.Bundle
+import android.os.ParcelFileDescriptor
 import android.view.ViewGroup
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -26,12 +29,19 @@ class MainActivity : Activity() {
     private var synth: PocketTtsSynthesizer? = null
     private var rebuildSynthWithIntent = false
 
+    companion object { private const val REQ_CLONE = 11 }
+
     private lateinit var status: TextView
     private lateinit var input: EditText
     private lateinit var voices: Spinner
     private lateinit var profiles: Spinner
     private lateinit var button: Button
     private lateinit var waveform: WaveformView
+    private val clonePending = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    // Custom clone read result (single activity-result contract, no ActivityResulting ties
+    // kept on the v1 API so this stays a plain Activity).
+    private var cloneUri: Uri? = null
 
     private fun gpuAvailable(): Boolean =
         try {
@@ -132,6 +142,22 @@ class MainActivity : Activity() {
             }
         }
         button = Button(this).apply { text = "Generate"; isEnabled = false }
+        val cloneButton = Button(this).apply {
+            text = "Clone voice…"
+            setOnClickListener {
+                // AndroidX is not a dependency here; use the framework picker via
+                // startActivityForResult (deprecated but functional).
+                val pick = Intent(Intent.ACTION_GET_CONTENT).apply {
+                    type = "audio/*"
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                }
+                try {
+                    startActivityForResult(pick, REQ_CLONE)
+                } catch (e: Throwable) {
+                    status.text = "No file picker: ${e.message}"
+                }
+            }
+        }
         val modelsButton = Button(this).apply {
             text = "Models"
             setOnClickListener {
@@ -140,8 +166,8 @@ class MainActivity : Activity() {
         }
         status = TextView(this).apply { text = "Loading model…"; textSize = 14f }
         waveform = WaveformView(this)
-        val topMargins = intArrayOf(0, 24, 32, 24, 24, 24)
-        for ((index, view) in listOf(input, voices, profiles, button, modelsButton, status).withIndex()) {
+        val topMargins = intArrayOf(0, 24, 24, 32, 24, 24, 24)
+        for ((index, view) in listOf(input, voices, cloneButton, profiles, button, modelsButton, status).withIndex()) {
             val params = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
             params.topMargin = topMargins[index]
@@ -187,8 +213,66 @@ class MainActivity : Activity() {
         }
     }
 
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_CLONE && resultCode == Activity.RESULT_OK && data?.data != null) {
+            cloneFromUri(data.data!!)
+        }
+    }
+
+    /** Read [uri], resample to mono, run the on-device clone, then select "custom". */
+    private fun cloneFromUri(uri: Uri) {
+        val bytes = try {
+            java.io.FileInputStream(
+                contentResolver.openFileDescriptor(uri, "r")!!.fileDescriptor)
+                .use { it.readBytes() }
+        } catch (e: Throwable) {
+            status.text = "Clone failed: ${e.message}"; return
+        }
+        cloneFromFile(java.io.File(filesDir, "clone_ref.wav").apply { writeBytes(bytes) })
+    }
+
+    /** Clone from a WAV on the app's filesDir, then select "custom". */
+    private fun cloneFromFile(abs: java.io.File) {
+        if (!clonePending.compareAndSet(false, true)) return
+        button.isEnabled = false
+        status.text = "Cloning voice…"
+        bg.execute {
+            try {
+                val wav = WavReader.read(abs.readBytes())
+                val frames = synth?.cloneVoice(wav.samples, wav.sampleRate)
+                    ?: throw IllegalStateException("synthesizer not ready")
+                runOnUiThread {
+                    android.util.Log.i("PocketTTS", "clone OK ($frames prompt frames)")
+                    status.text = "Cloned voice ($frames prompt frames). Selecting custom."
+                    val all = (0 until voices.adapter!!.count)
+                        .map { voices.adapter!!.getItem(it) as String }
+                        .toMutableList().apply { add("custom") }
+                    voices.adapter = ArrayAdapter(
+                        this, android.R.layout.simple_spinner_dropdown_item, all)
+                    voices.setSelection(voices.adapter!!.count - 1)
+                    button.isEnabled = true
+                    // headless (--es ref): continue to generate once cloned
+                    if (intent?.hasExtra("ref") == true &&
+                        input.text.toString().isNotBlank()) {
+                        button.performClick()
+                    }
+                }
+            } catch (e: Throwable) {
+                android.util.Log.e("PocketTTS", "clone failed", e)
+                runOnUiThread {
+                    status.text = "Clone failed: ${e.message}"
+                    button.isEnabled = true
+                }
+            } finally {
+                clonePending.set(false)
+            }
+        }
+    }
+
     /** Headless driving: adb shell am start ... --es text "..." --es voice alba
-     *  --es engine standard|studio|fast
+     *  --es profile standard|studio|fast  [--es ref /path/to/ref.wav]
+     *  `ref` clones from a WAV on the device files dir before generating.
      *  (singleTop, so a second am start generates again without reloading). */
     private fun runFromIntent(i: android.content.Intent?) {
         val t = i?.getStringExtra("text") ?: return
@@ -201,7 +285,13 @@ class MainActivity : Activity() {
             val idx = Profile.entries.indexOfFirst { it.name.equals(e, true) }
             if (idx >= 0) profiles.setSelection(idx)
         }
-        if (button.isEnabled) button.performClick()
+        val ref = i.getStringExtra("ref")
+        if (ref != null) {
+            val f = java.io.File(filesDir, ref)
+            if (f.exists()) cloneFromFile(f) else status.text = "ref not found: $ref"
+        } else if (button.isEnabled) {
+            button.performClick()
+        }
     }
 
     override fun onNewIntent(intent: android.content.Intent) {

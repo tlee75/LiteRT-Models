@@ -314,67 +314,62 @@ def load_eager():
     return model
 
 
-def inject_encoder_weights(model, onnx_path=None):
+def inject_encoder_weights(model, weights_path=None):
     """Load the reference-audio encoder weights into the eager model in place.
 
     The bundled (without-voice-cloning) weights zero the whole encoder so the
     shipped app cannot clone: `TTSModel.load_model()` falls back to the
-    no-cloning bundle and marks `has_voice_cloning=False`. But the Mimi codec
-    (encoder + decoder + both transformers) is bit-identical between the
-    english_2026-04 and english_2026-09 releases — the robustness fine-tune
-    only re-distilled the flow-LM. So the encoder from the fp32 english_2026-04
-    ONNX export (`mimi_encoder.onnx`) is byte-compatible with the 2026-09 flow-LM
-    we deploy. Only `speaker_proj_weight` (part of the flow-LM) is taken from
-    the live no-cloning bundle the script already loaded.
+    no-cloning bundle and marks `has_voice_cloning=False`. This injects the
+    live encoder from the AUTHORITATIVE gated `kyutai/pocket-tts` bundle
+    (forwarded by PyPI's download gate: automatic approval once the repo's
+    access is granted, token via HF_TOKEN). The 2026-09 `languages/
+    english_2026-09/model.safetensors` carries the exact weights our deployed
+    graphs were built from: same Mimi codec, `speaker_proj [1024,32]`, and it
+    matches the flow-LM we deploy bit-for-bit.
 
-    We transfer every `mimi.*` initializer the ONNX carries that also exists
-    under the eager model's `mimi.*` namespace (SEANet encoder, encoder
-    transformer, downsample). `speaker_proj` in the ONNX graph is a folded
-    [32,1024] linear that is NOT copied here: the eager `flow_lm` value is the
-    authoritative 2026-09 weight and matches the deployed fused LM.
-
-    Returns the injected model (same object, mutated).
+    Only the ENCODER tensors are transferred (`mimi.encoder.*`,
+    `mimi.encoder_transformer.*`, `mimi.downsample.*`); `speaker_proj_weight`
+    already lives in the eager model from the live no-cloning bundle (its
+    values are identical here — verified) and the flow-LM is untouched, so the
+    injected encoder + the deployed fused LM come from the same release.
     """
-    import onnx
-    if onnx_path is None:
-        here = os.path.dirname(os.path.abspath(__file__))
-        # default matches the onnx-web-bench fetched fp32 english_2026-04 mirror
-        cands = [
-            os.path.join(here, "../../../audiobook/onnx-web-bench/pocket-model"
-                               "/english_2026-04-fp32/mimi_encoder.onnx"),
-        ]
-        onnx_path = cands[0]
-    assert os.path.exists(onnx_path), f"encoder ONNX not found: {onnx_path}"
-    g = onnx.load(onnx_path).graph
-    inits = {t.name: t for t in g.initializer}
+    if weights_path is None:
+        from huggingface_hub import hf_hub_download
+        weights = hf_hub_download(
+            "kyutai/pocket-tts", "languages/english_2026-09/model.safetensors",
+            revision="983151f13aaeab1b13c1e5e3c2c383d49a9edf3f",
+        )
+    else:
+        weights = weights_path
+    import safetensors.torch
+    sd = safetensors.torch.load_file(weights)
     got = 0
-    for name, t in inits.items():
+    for name, t in sd.items():
         if not name.startswith("mimi."):
             continue
         if "encoder_transformer.transformer.layers." not in name and \
            "mimi.encoder.model." not in name and \
            "mimi.downsample." not in name:
             continue
-        arr = np.frombuffer(t.raw_data, dtype=np.float32).reshape(list(t.dims))
+        arr = t.detach().cpu().float().numpy()
         # eager namespace lookup
-        mod = model
         ok = False
         try:
             parts = name.split(".")
-            obj = mod
+            obj = model
             for p in parts[:-1]:
                 obj = obj.__getattr__(p)
             leaf = getattr(obj, parts[-1])
             if isinstance(leaf, torch.Tensor):
                 if tuple(leaf.shape) != tuple(arr.shape):
-                    print(f"  [inject] SKIP {name}: shape {leaf.shape} vs ONNX {arr.shape}")
+                    print(f"  [inject] SKIP {name}: shape {leaf.shape} vs bundle {arr.shape}")
                     continue
                 leaf.data.copy_(torch.from_numpy(arr))
                 got += 1
                 ok = True
         except Exception as e:
             print(f"  [inject] SKIP {name}: {e}")
-    print(f"[inject] encoder weights from {os.path.basename(onnx_path)}: {got} tensors")
+    print(f"[inject] encoder weights from {os.path.basename(weights)}: {got} tensors")
     model.mimi.encoder.eval()
     return model
 
@@ -1287,6 +1282,11 @@ def stage_assets(model):
     inw.tofile(os.path.join(OUT, "pt_input_linear_f32.bin"))
     bos = (flm.bos_emb.detach() @ flm.input_linear.weight.detach().T).numpy().astype(np.float32)
     bos.tofile(os.path.join(OUT, "pt_bos_input_f32.bin"))
+    # voice-clone prompt BOS: prepended to the encoded conditioning before the
+    # flow-LM prompt pass (mirrors pocket_tts get_state_for_audio_prompt when
+    # insert_bos_before_voice=true)
+    flm.bos_before_voice.detach().cpu().numpy().astype(np.float32).tofile(
+        os.path.join(OUT, "pt_bos_before_voice_f32.bin"))
     neutral_latent(model).numpy().astype(np.float32).tofile(
         os.path.join(OUT, "pt_neutral_latent_f32.bin"))
     print(f"embed {emb.shape} fp16, input_linear {inw.shape}, bos [1024], neutral [32]")

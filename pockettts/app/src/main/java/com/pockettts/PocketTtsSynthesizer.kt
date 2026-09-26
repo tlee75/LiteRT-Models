@@ -67,6 +67,12 @@ class PocketTtsSynthesizer(
         const val SPF = 1920             // samples per 12.5 Hz frame
         const val SAMPLE_RATE = 24000
 
+        // Voice-clone encoder: audio[1,1,ENC_AUDIO] -> conditioning[1,ENC_MAX,1024].
+        // Size a full reference window at 160 latent frames = 12.8 s @ 12.5 Hz.
+        // The app pads shorter references (zero tail) and slices the real frames.
+        const val ENC_MAX = 160
+        const val ENC_AUDIO = ENC_MAX * SPF
+
         // Generation defaults from the english config / pocket_tts defaults.
         const val TEMP = 0.3f
         const val EOS_THRESHOLD = -4.0f
@@ -86,6 +92,8 @@ class PocketTtsSynthesizer(
         const val INPUT_LINEAR = "pt_input_linear_f32.bin"
         const val BOS = "pt_bos_input_f32.bin"
         const val NEUTRAL = "pt_neutral_latent_f32.bin"
+        const val BOS_VOICE = "pt_bos_before_voice_f32.bin"   // clone prompt BOS
+        const val ENCODER = "pt_mimi_encode.tflite"           // fp32, CPU clone
         const val TOKENIZER = "pt_tokenizer.tsv"
 
         // CC-BY-4.0 (alba-mackenna, VCTK) and CC0 (voice-donations, voice-zero)
@@ -332,9 +340,17 @@ class PocketTtsSynthesizer(
     private val dectx = dectxP.first
     private val deconly = deconlyP.first
 
-    /** e.g. "lm:GPU dectx:GPU dec:GPU" — shown in the UI status line. */
+    // Clone encoder: fp32 graph, always CPU (one-shot reference encode; keeps
+    // Adreno fp16 compute quirks away from the clone path entirely).
+    private val encoder =
+        if (File(modelDir, ENCODER).exists())
+            CompiledModel.create(path(ENCODER).absolutePath, cpuOpts(), null)
+        else null
+
+    /** e.g. "lm:GPU dectx:CPU dec:GPU" — shown in the UI status line. */
     val placements =
-        "lm:${lmP.second} dectx:${dectxP.second} dec:${deconlyP.second}"
+        "lm:${lmP.second} dectx:${dectxP.second} dec:${deconlyP.second}" +
+            (if (encoder != null) " enc:CPU" else " enc:off")
 
     private val lmIn = lm.createInputBuffers()
     private val lmOut = lm.createOutputBuffers()
@@ -342,6 +358,8 @@ class PocketTtsSynthesizer(
     private val dectxOut = dectx.createOutputBuffers()
     private val deconlyIn = deconly.createInputBuffers()
     private val deconlyOut = deconly.createOutputBuffers()
+    private val encIn: List<com.google.ai.edge.litert.TensorBuffer>? = encoder?.createInputBuffers()
+    private val encOut: List<com.google.ai.edge.litert.TensorBuffer>? = encoder?.createOutputBuffers()
 
     // ---- host assets ------------------------------------------------------
     private val embChannel = RandomAccessFile(path(EMBED), "r").channel
@@ -350,6 +368,8 @@ class PocketTtsSynthesizer(
     private val inputLinear = readF32(path(INPUT_LINEAR))      // [1024, 32] row-major
     private val bosInput = readF32(path(BOS))                  // [1024]
     private val neutral = readF32(path(NEUTRAL))               // [32]
+    private val bosBeforeVoice =                                // cloned prompt's first frame
+        if (File(modelDir, BOS_VOICE).exists()) readF32(path(BOS_VOICE)) else null    // [1024]
     val tokenizer = SpTokenizer(path(TOKENIZER))
 
     private val endTokens: Set<Int>
@@ -389,6 +409,87 @@ class PocketTtsSynthesizer(
         val k = FloatArray(n) { Half.toFloat(bb.short) }
         val v = FloatArray(n) { Half.toFloat(bb.short) }
         voiceK = k; voiceV = v; voiceLen = t; voiceName = name
+    }
+
+    /**
+     * Clone a voice from a mono reference at [sr] Hz. Mirrors the reference
+     * `get_state_for_audio_prompt`:
+     *   1. resample to 24 kHz, pad to one fixed encoder window (ENC_AUDIO);
+     *   2. encoder graph -> conditioning [1,ENC_MAX,1024];
+     *   3. prepend bos_before_voice -> [1,T+1,1024];
+     *   4. prompt the flow-LM one frame at a time (the batched eager path is
+     *      position-independent: same RoPE, same causal mask, KV appended);
+     *   5. snapshot pk/pv into the voice state (T+1 frames) so the next
+     *      `loadVoice("custom")` continues from the cloned speaker.
+     * The cloned state lives only in memory; caller persists it if wanted.
+     * Returns the number of prompt frames (T+1).
+     */
+    @Throws(IllegalStateException::class)
+    fun cloneVoice(audioF32: FloatArray, sr: Int): Int {
+        check(encoder != null && encIn != null && encOut != null) {
+            "encoder graph missing — push pt_mimi_encode.tflite first"
+        }
+        check(bosBeforeVoice != null) {
+            "missing $BOS_VOICE — rebuild assets with build_pockettts.py"
+        }
+        val mono = if (sr == SAMPLE_RATE) audioF32 else resampleMono(audioF32, sr, SAMPLE_RATE)
+
+        // pad/truncate to ENC_AUDIO with a zero tail (the SEANet encoder is
+        // causal: real frames are exact; only the zero tail is wasted).
+        val window = FloatArray(ENC_AUDIO)
+        System.arraycopy(mono, 0, window, 0, minOf(mono.size, ENC_AUDIO))
+
+        encIn!![0].writeFloat(window)
+        encoder!!.run(encIn!!, encOut!!)
+        val cond = encOut!![0].readFloat()                       // [ENC_MAX*1024]
+
+        // frames of conditioning actually present (audio shorter than a window
+        // yields fewer than ENC_MAX latent frames; eager pads to a multiple of
+        // SPF -- ours zero-pads, losing <1 frame, and we use the exact counts)
+        var nCond = minOf((mono.size + SPF - 1) / SPF, ENC_MAX)
+        if (nCond < 1) nCond = 1
+
+        // prompt: bos_before_voice + cond[0..nCond)
+        resetToEmpty()
+        step(bosBeforeVoice!!, zeroNoise)
+        for (i in 0 until nCond) {
+            val emb = cond.copyOfRange(i * H, (i + 1) * H)
+            step(emb, zeroNoise)
+        }
+        val t = nCond + 1
+        val n = G * t * HD
+        val k = FloatArray(n); val v = FloatArray(n)
+        for (g in 0 until G) {
+            System.arraycopy(pk, g * PMAX * HD, k, g * t * HD, t * HD)
+            System.arraycopy(pv, g * PMAX * HD, v, g * t * HD, t * HD)
+        }
+        voiceK = k; voiceV = v; voiceLen = t; voiceName = "custom"
+        return t
+    }
+
+    /** Snapshot-equivalent of resetToVoice with an EMPTY voice (pos starts at 0). */
+    private fun resetToEmpty() {
+        pk.fill(0f); pv.fill(0f)
+        mask.fill(MASK_NEG)
+        for (h in 0 until NH) {
+            mask[h * (PMAX + 1) + PMAX] = 0f                  // current token seat
+        }
+        pos = 0
+    }
+
+    /** Linear resample to 24 kHz mono (reference path; encoder sees 24 kHz). */
+    private fun resampleMono(src: FloatArray, inRate: Int, outRate: Int): FloatArray {
+        if (inRate == outRate) return src
+        val n = ((src.size.toLong() * outRate) / inRate).toInt()
+        val out = FloatArray(n)
+        for (i in 0 until n) {
+            val t = (i.toFloat() * inRate) / outRate
+            val i0 = t.toInt().coerceIn(0, src.size - 1)
+            val i1 = (i0 + 1).coerceIn(0, src.size - 1)
+            val f = t - t.toInt()
+            out[i] = src[i0] * (1f - f) + src[i1] * f
+        }
+        return out
     }
 
     private fun resetToVoice() {
@@ -493,7 +594,9 @@ class PocketTtsSynthesizer(
     /** Generate speech for `text` with the currently loaded voice. */
     fun synthesize(text: String, voice: String): Result {
         val t0 = System.nanoTime()
-        loadVoice(voice)
+        if (voice == "custom" && voiceName == "custom") {
+            // in-memory clone from cloneVoice(); no file to load
+        } else loadVoice(voice)
         val audio = ArrayList<FloatArray>()
         var frames = 0
         val chunks = splitIntoBestSentences(text)
@@ -651,9 +754,11 @@ class PocketTtsSynthesizer(
     }
 
     override fun close() {
-        listOf(lmIn, lmOut, dectxIn, dectxOut, deconlyIn, deconlyOut)
+        listOf(lmIn, lmOut, dectxIn, dectxOut, deconlyIn, deconlyOut,
+            encIn ?: emptyList(), encOut ?: emptyList())
             .forEach { l -> l.forEach { it.close() } }
-        lm.close(); dectx.close(); deconly.close(); embChannel.close()
+        lm.close(); dectx.close(); deconly.close(); encoder?.close()
+        embChannel.close()
         tempModels.forEach { it.delete() }
         tempModels.clear()
     }
@@ -662,6 +767,67 @@ class PocketTtsSynthesizer(
         val b = f.readBytes()
         val bb = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN)
         return FloatArray(b.size / 4) { bb.float }
+    }
+}
+
+/**
+ * Minimal RIFF/WAVE reader: extracts mono float samples ([-1,1]) at the given
+ * sample rate. Supports PCM (8/16/24/32-bit) and IEEE float32. Stereo is
+ * averaged to mono. Channel / format tetris only — no dither, no VBR, and no
+ * float64 PCM (rare). The synth resamples to 24 kHz afterwards.
+ */
+object WavReader {
+    data class Wav(val samples: FloatArray, val sampleRate: Int)
+
+    fun read(bytes: ByteArray): Wav {
+        require(bytes.size >= 44) { "too short for a WAV header" }
+        val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        fun tag(i: Int): String = String(bytes, i, 4, Charsets.US_ASCII)
+        require(tag(0) == "RIFF") { "not a RIFF file (tag=${tag(0)})" }
+        require(tag(8) == "WAVE") { "not a WAVE file (tag=${tag(8)})" }
+        var fmtChunk: Int = -1; var dataOff = -1; var dataLen = 0
+        var pos = 12
+        while (pos + 8 <= bytes.size) {
+            val id = tag(pos); val len = bb.getInt(pos + 4)
+            when (id) {
+                "fmt " -> fmtChunk = pos + 8                          // "fmt "
+                "data" -> { dataOff = pos + 8; dataLen = len }        // "data"
+            }
+            pos += 8 + len + (len and 1)                                  // pad byte
+        }
+        require(fmtChunk >= 0) { "missing fmt chunk" }
+        val fmt = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        val audioFormat = fmt.getShort(fmtChunk).toInt() and 0xFFFF
+        val channels = fmt.getShort(fmtChunk + 2).toInt()
+        val sampleRate = fmt.getInt(fmtChunk + 4)
+        val bits = fmt.getShort(fmtChunk + 14).toInt() and 0xFFFF
+        val isFloat = audioFormat == 3
+        require(audioFormat == 1 || isFloat) { "unsupported format $audioFormat (use PCM or float)" }
+        require(channels > 0 && bits in intArrayOf(8, 16, 24, 32)) { "unsupported layout" }
+
+        val nFrames = dataLen / (channels * (bits / 8))
+        val out = FloatArray(nFrames)
+        val data = ByteBuffer.wrap(bytes, dataOff, dataLen).order(ByteOrder.LITTLE_ENDIAN)
+        for (f in 0 until nFrames) {
+            var acc = 0.0
+            for (c in 0 until channels) {
+                acc += when {
+                    isFloat -> data.float.toDouble()
+                    bits == 8 -> ((data.get().toInt() and 0xFF) - 128) / 128.0
+                    bits == 16 -> data.short.toDouble() / 32768.0
+                    bits == 32 -> data.int.toDouble() / 2147483648.0
+                    else -> {                                    // 24-bit
+                        val b0 = data.get().toInt() and 0xFF
+                        val b1 = data.get().toInt() and 0xFF
+                        val b2 = data.get().toInt() and 0xFF
+                        val raw = (b0) or (b1 shl 8) or (b2 shl 16)
+                        (if (raw and 0x800000 != 0) raw - 0x1000000 else raw) / 8388608.0
+                    }
+                }
+            }
+            out[f] = (acc / channels).toFloat()
+        }
+        return Wav(out, sampleRate)
     }
 }
 
