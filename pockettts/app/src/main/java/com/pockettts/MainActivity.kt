@@ -8,6 +8,7 @@ import android.media.AudioManager
 import android.media.AudioTrack
 import android.net.Uri
 import android.os.Bundle
+import android.os.ParcelFileDescriptor
 import android.view.View
 import android.view.ViewGroup
 import android.widget.ArrayAdapter
@@ -269,28 +270,175 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Read [uri], resample to mono, run the on-device clone, then select "custom". */
+    /** Read [uri], decode to mono float at its native rate, then clone. */
     private fun cloneFromUri(uri: Uri) {
-        val bytes = try {
-            java.io.FileInputStream(
-                contentResolver.openFileDescriptor(uri, "r")!!.fileDescriptor)
-                .use { it.readBytes() }
-        } catch (e: Throwable) {
-            status.text = "Clone failed: ${e.message}"
-            voices.setSelection(0)
-            return
+        bg.execute {
+            try {
+                // MediaCodec decodes any container (mp3/m4a/ogg/wav); falls back
+                // to the RIFF parser if the framework can't (e.g. odd PCM).
+                val wav = decodeAudio(uri)
+                    ?: WavReader.read(readUriBytes(uri))
+                val frames = synth?.cloneVoice(wav.samples, wav.sampleRate)
+                    ?: throw IllegalStateException("synthesizer not ready")
+                runOnUiThread {
+                    android.util.Log.i("PocketTTS", "clone OK ($frames prompt frames)")
+                    hasCustomVoice = true
+                    refreshVoiceAdapter()
+                    val idx = voiceLabels().indexOf("custom")
+                    voices.setSelection(if (idx >= 0) idx else 0)
+                    status.text = "Cloned voice ($frames prompt frames). Selected custom."
+                    generate.isEnabled = true
+                }
+            } catch (e: Throwable) {
+                android.util.Log.e("PocketTTS", "clone failed", e)
+                runOnUiThread {
+                    status.text = "Clone failed: ${e.message}"
+                    generate.isEnabled = true
+                    voices.setSelection(0)
+                }
+            } finally {
+                clonePending.set(false)
+            }
         }
-        cloneFromFile(java.io.File(filesDir, "clone_ref.wav").apply { writeBytes(bytes) })
     }
 
-    /** Clone from a WAV on the app's filesDir, then select "custom". */
+    private fun readUriBytes(uri: Uri): ByteArray =
+        java.io.FileInputStream(
+            contentResolver.openFileDescriptor(uri, "r")!!.fileDescriptor)
+            .use { it.readBytes() }
+
+    /**
+     * Generic audio decode via MediaExtractor+MediaCodec: returns mono float
+     * PCM at the file's native sample rate (the synth linear-resamples to 24
+     * kHz). A bounded one-shot reference (the encoder uses ~12.8 s max).
+     * Uses a ParcelFileDescriptor data source (safe for both content:// and
+     * file:// of app-private storage) with a hard iteration cap so it can
+     * never hang. Returns null if the framework has no decoder for the track
+     * (the caller falls back to [WavReader] for pure waved files).
+     */
+    private fun decodeAudio(uri: Uri): WavReader.Wav? {
+        val pfd: ParcelFileDescriptor = try {
+            contentResolver.openFileDescriptor(uri, "r") ?: return null
+        } catch (e: Throwable) {
+            android.util.Log.w("PocketTTS", "openFailed ${e.message}")
+            return null
+        }
+        val extractor = android.media.MediaExtractor()
+        var codec: android.media.MediaCodec? = null
+        try {
+            try {
+                extractor.setDataSource(pfd.fileDescriptor, 0L,
+                    pfd.statSize.takeIf { it >= 0 } ?: java.lang.Long.MAX_VALUE)
+            } catch (e: Throwable) {
+                android.util.Log.w("PocketTTS", "setDataSource ${e.message}")
+                return null
+            }
+            var track = -1
+            var fmt: android.media.MediaFormat? = null
+            for (i in 0 until extractor.trackCount) {
+                val m = extractor.getTrackFormat(i)
+                val mime = m.getString(android.media.MediaFormat.KEY_MIME)
+                if (mime?.startsWith("audio/") == true) { track = i; fmt = m; break }
+            }
+            if (track < 0 || fmt == null) return null
+            extractor.selectTrack(track)
+            val sr = fmt.getInteger(android.media.MediaFormat.KEY_SAMPLE_RATE)
+            val ch = fmt.getInteger(android.media.MediaFormat.KEY_CHANNEL_COUNT, 1)
+            codec = try {
+                android.media.MediaCodec.createDecoderByType(
+                    fmt.getString(android.media.MediaFormat.KEY_MIME)!!)
+            } catch (e: Throwable) {
+                android.util.Log.w("PocketTTS", "no codec ${e.message}")
+                return null
+            }
+            codec.configure(fmt, null, null, 0)
+            codec.start()
+            android.util.Log.i("PocketTTS", "decode: codec ${fmt.getString(android.media.MediaFormat.KEY_MIME)} start, sr=$sr ch=$ch")
+            val info = android.media.MediaCodec.BufferInfo()
+            val pcm = java.io.ByteArrayOutputStream(1 shl 20)
+            var eof = false
+            var guard = 0
+            while (guard++ < 1_000_000) {
+                if (!eof) {
+                    var fed = 0
+                    while (true) {
+                        val ii = codec.dequeueInputBuffer(0)
+                        if (ii < 0) break
+                        val ib = codec.getInputBuffer(ii) ?: break
+                        val n = extractor.readSampleData(ib, 0)
+                        if (n < 0) {
+                            codec.queueInputBuffer(ii, 0, 0, 0,
+                                android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            eof = true
+                        } else {
+                            val st = extractor.sampleTime
+                            val sf = extractor.sampleFlags
+                            // advance the extractor cursor to the NEXT sample
+                            // (readSampleData alone does not move it)
+                            extractor.advance()
+                            codec.queueInputBuffer(ii, 0, n, st, sf)
+                        }
+                        fed++
+                        if (eof) break
+                        if (fed > 64) break   // bound: drain some before feeding more
+                    }
+                    if (fed > 64) android.util.Log.i("PocketTTS", "decode: fed burst $fed")
+                }
+                val oi = codec.dequeueOutputBuffer(info, if (eof) 20_000 else 100)
+                if (oi >= 0) {
+                    val ob = codec.getOutputBuffer(oi)
+                    if (ob != null) {
+                        ob.position(0); ob.limit(info.size)
+                        ob.order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                        val b = ByteArray(info.size); ob.get(b); pcm.write(b)
+                    }
+                    val eos = info.flags and
+                        android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+                    codec.releaseOutputBuffer(oi, false)
+                    if (eos) {
+                        android.util.Log.i("PocketTTS", "decode: ${pcm.size()}B pcm, sr=$sr ch=$ch")
+                        return toMono(pcm.toByteArray(), ch, sr)
+                    }
+                } else if (oi == android.media.MediaCodec.INFO_TRY_AGAIN_LATER && eof) {
+                    android.util.Log.i("PocketTTS", "decode: drained ${pcm.size()}B pcm, sr=$sr ch=$ch")
+                    return toMono(pcm.toByteArray(), ch, sr)
+                }
+            }
+            android.util.Log.w("PocketTTS", "decode guard hit")
+            return toMono(pcm.toByteArray(), ch, sr)
+        } catch (e: Throwable) {
+            android.util.Log.w("PocketTTS", "decode failed ${e.message}")
+            return null
+        } finally {
+            codec?.release()
+            extractor.release()
+            pfd.close()
+        }
+    }
+
+    /** s16le interleaved [..c][..c] -> mono float [-1,1] (channel average). */
+    private fun toMono(pcm: ByteArray, ch: Int, sr: Int): WavReader.Wav {
+        val bb = java.nio.ByteBuffer.wrap(pcm).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        val shorts = pcm.size / 2
+        val frames = shorts / ch
+        val f32 = FloatArray(frames) { i ->
+            var acc = 0.0
+            for (c in 0 until ch) acc += bb.getShort(2 * (i * ch + c)).toDouble() / 32768.0
+            (acc / ch).toFloat()
+        }
+        return WavReader.Wav(f32, sr)
+    }
+
+    /** Clone from a WAV/audio on the app's filesDir, then select "custom". */
     private fun cloneFromFile(abs: java.io.File) {
         if (!clonePending.compareAndSet(false, true)) return
         generate.isEnabled = false
         status.text = "Cloning voice…"
         bg.execute {
             try {
-                val wav = WavReader.read(abs.readBytes())
+                // file:// URI decode (MediaCodec for any container) + RIFF fallback
+                val wav = decodeAudio(Uri.fromFile(abs))
+                    ?: WavReader.read(abs.readBytes())
                 val frames = synth?.cloneVoice(wav.samples, wav.sampleRate)
                     ?: throw IllegalStateException("synthesizer not ready")
                 runOnUiThread {
