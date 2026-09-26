@@ -114,10 +114,12 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
     // Keys that use force_gpu_opts.txt (normally just the LM).
     private val forceGpuOpts = overrideSet("force_gpu_opts_keys.txt")
 
-    // `force_int8_lm.txt` present -> use *_int8.tflite graphs for LM + Mimi
-    // instead of the fp16 files. The int8 graphs keep fp32 I/O so the host KV
-    // contract is unchanged; used for CPU-only benchmarks.
-    private val int8 = File(modelDir, "force_int8_lm.txt").exists()
+    // `force_fp16_lm.txt` opts OUT of the default int8 LM. Default = *_int8
+    // graphs for LM + Mimi: weight-only int8 gives the best size (85.7 vs
+    // 169 MB) and quality, works everywhere (GPU or CPU), and the decoder
+    // placement logic below keeps it clean. The int8 graphs keep fp32 I/O so
+    // the host KV contract is unchanged.
+    private val int8 = !File(modelDir, "force_fp16_lm.txt").exists()
     // `force_fp32_graph.txt` -> LM uses the full-fp32 graph (fp32 weights) for
     // speed comparisons vs the fp16-weight graph at FP32 compute (GPU32).
     private val fp32graph = File(modelDir, "force_fp32_graph.txt").exists()
@@ -151,7 +153,7 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
     //   dec forced to CPU -> fp16 deconly (clean);
     //   dec on GPU -> int8 deconly (clean + fast, RTF ~0.27);
     //   force_fp16_dec / force_int8_dec / force_fp32_dec override explicitly.
-    private val decOnCpu = "dec" in forceCpu
+    private val decOnCpu = "dec" in forceCpu || int8
     private val deconlyPath =
         when {
             fp32dec -> "pt_mimi_deconly.tflite"
@@ -277,10 +279,14 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
         return tmp
     }
 
-    /** Compile on GPU; fall back to CPU (fp16 weights dequantize to fp32 there). */
+    /** CPU is the default for int8 (universal, GPU-free); fp16 goes to GPU by
+     * default. Explicit GPU requests (force_gpu.txt / force_fp32.txt /
+     * force_gpu_opts_keys.txt) override the int8-CPU default; force_cpu.txt
+     * overrides everything. Falls back to CPU on any delegate failure. */
     private fun load(name: String, key: String): Pair<CompiledModel, String> {
         val p = path(name).absolutePath
-        if (key in forceCpu) {
+        val gpuRequested = key in forceGpu || key in forceFp32 || key in forceGpuOpts
+        if (key in forceCpu || (int8 && !gpuRequested)) {
             return CompiledModel.create(p, cpuOpts(), null) to "CPU*"
         }
         // eps override applies to the fp16 LM graph only (see force_eps.txt).
