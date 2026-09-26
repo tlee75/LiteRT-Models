@@ -163,12 +163,15 @@ class MainActivity : Activity() {
                     val line = "Spoke %.1fs (%d frames) in %d ms — %.2fx real-time (%s)"
                         .format(secs, r.frames, r.ms, rtf, s.placements)
                     android.util.Log.i("PocketTTS", line)
-                    runOnUiThread {
-                        status.text = line
-                        button.isEnabled = true
-                        waveform.start(r.audio, PocketTtsSynthesizer.SAMPLE_RATE)
+                    // Play first; the waveform starts exactly when audio starts
+                    // (inside play()) so the visual doesn't run ahead of the ear.
+                    play(r.audio) {
+                        runOnUiThread {
+                            status.text = line
+                            button.isEnabled = true
+                            waveform.start(r.audio, PocketTtsSynthesizer.SAMPLE_RATE)
+                        }
                     }
-                    play(r.audio)
                 } catch (e: Throwable) {
                     android.util.Log.e("PocketTTS", "generation failed", e)
                     runOnUiThread { status.text = "Error: ${e.message}"; button.isEnabled = true }
@@ -213,7 +216,9 @@ class MainActivity : Activity() {
         java.io.File(filesDir, "output_$voice.wav").writeBytes(bb.array())
     }
 
-    private fun play(audio: FloatArray) {
+    /** Play `audio`, invoking [onStart] the moment playback begins so the
+     *  waveform and the sound start together (not waveform-first). */
+    private fun play(audio: FloatArray, onStart: () -> Unit) {
         if (audio.isEmpty()) return
         val track = AudioTrack(
             AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).build(),
@@ -226,6 +231,7 @@ class MainActivity : Activity() {
         )
         track.write(audio, 0, audio.size, AudioTrack.WRITE_BLOCKING)
         track.play()
+        onStart()
         Thread.sleep((audio.size * 1000L / PocketTtsSynthesizer.SAMPLE_RATE) + 250)
         track.release()
     }
