@@ -116,9 +116,9 @@ class MainActivity : Activity() {
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            fitsSystemWindows = true
-            setPadding(48, 48, 48, 48)
+            setPadding(48, 24, 48, 24)
         }
+        UiInsets.belowStatus(root)
         input = EditText(this).apply {
             hint = "Enter text to speak"
             setText("Hello! I am Pocket TTS, a tiny hundred million parameter model speaking to you from this phone.")
