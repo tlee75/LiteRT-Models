@@ -44,7 +44,6 @@ class MainActivity : Activity() {
     private lateinit var profiles: Spinner
     private lateinit var generate: Button
     private lateinit var play: Button
-    private lateinit var waveform: WaveformView
     private val clonePending = java.util.concurrent.atomic.AtomicBoolean(false)
 
     // Last generated audio (replayable via Play).
@@ -193,8 +192,7 @@ class MainActivity : Activity() {
             }
         }
         status = TextView(this).apply { text = "Loading model…"; textSize = 14f }
-        waveform = WaveformView(this)
-        // input, voices, profiles, generate, play, files, status, (waveform)
+        // input, voices, profiles, generate, play, files, status
         val topMargins = intArrayOf(0, 24, 24, 32, 0, 24, 24)
         for ((index, view) in listOf(input, voices, profiles, generate, play, filesButton, status).withIndex()) {
             val params = LinearLayout.LayoutParams(
@@ -202,8 +200,6 @@ class MainActivity : Activity() {
             params.topMargin = topMargins[index]
             root.addView(view, params)
         }
-        root.addView(waveform, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f).apply { topMargin = 24 })
         setContentView(root)
 
         rebuildSynthWithIntent = true
@@ -554,7 +550,6 @@ class MainActivity : Activity() {
         t.play()
         track = t
         play.text = "Stop"
-        runOnUiThread { waveform.start(audio, PocketTtsSynthesizer.SAMPLE_RATE) }
         Thread {
             Thread.sleep((audio.size * 1000L / PocketTtsSynthesizer.SAMPLE_RATE) + 250)
             // reset to "Play" only if this is still the live track
