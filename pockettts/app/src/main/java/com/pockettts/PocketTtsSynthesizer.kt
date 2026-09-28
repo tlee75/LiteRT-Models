@@ -612,8 +612,11 @@ class PocketTtsSynthesizer(
         return latent to eos
     }
 
-    /** Generate speech for `text` with the currently loaded voice. */
-    fun synthesize(text: String, voice: String): Result {
+    /** Generate speech for `text` with the currently loaded voice. [onProgress]
+     *  (when set) reports 0..1 over the generated frames on the CALLING thread
+     *  — the Settings preview uses it to render "Generating Preview N%"; normal
+     *  reading passes nothing. */
+    fun synthesize(text: String, voice: String, onProgress: ((Float) -> Unit)? = null): Result {
         val t0 = System.nanoTime()
         if (voice == "custom" && voiceName == "custom") {
             // in-memory clone from cloneVoice(); no file to load
@@ -621,10 +624,23 @@ class PocketTtsSynthesizer(
         val audio = ArrayList<FloatArray>()
         var frames = 0
         val chunks = splitIntoBestSentences(text)
-        for (chunk in chunks) {
-            val (prepared, eosGuess) = prepareTextPrompt(chunk)
-            val ids = tokenizer.encode(prepared)
-            val latents = generateChunk(ids, framesAfterEos = eosGuess + 2)
+        // Pre-tokenize + estimate frames per chunk so progress reflects the
+        // real work (each chunk is one contiguous <=50-token generation).
+        val prepared = chunks.map { prepareTextPrompt(it) }
+        val idsList = prepared.map { (p, _) -> tokenizer.encode(p) }
+        val ests = idsList.map { estFrames(it) }
+        val totalEst = ests.sum()
+        onProgress?.invoke(if (totalEst > 0) 0f else 1f)
+        var doneEst = 0
+        for ((ci, ids) in idsList.withIndex()) {
+            val est = ests[ci]
+            val latents = generateChunk(ids, framesAfterEos = prepared[ci].second + 2) { g, gMax ->
+                if (onProgress != null && totalEst > 0 && gMax > 0) {
+                    onProgress(((doneEst + est * (g.toFloat() + 1f) / gMax) / totalEst)
+                        .coerceIn(0f, 1f))
+                }
+            }
+            doneEst += est
             android.util.Log.i(
                 "PocketTTS",
                 "chunk: ${ids.size} tokens -> ${latents.size} frames",
@@ -632,6 +648,7 @@ class PocketTtsSynthesizer(
             frames += latents.size
             if (latents.isNotEmpty()) audio.add(decode(latents))
         }
+        onProgress?.invoke(1f)   // never dangle below 100% on early-exit paths
         val total = audio.sumOf { it.size }
         val out = FloatArray(total)
         var o = 0
@@ -643,8 +660,21 @@ class PocketTtsSynthesizer(
         return Result(out, frames, (System.nanoTime() - t0) / 1_000_000)
     }
 
-    /** The reference autoregressive loop for one <=50-token chunk. */
-    private fun generateChunk(ids: IntArray, framesAfterEos: Int): List<FloatArray> {
+    /** Expected generated frames for one token-chunk (mirrors generateChunk's
+     *  estimate, without the KV-capacity clamp — used only for progress ratios). */
+    private fun estFrames(ids: IntArray): Int {
+        val estimate = ceil((ids.size / TOKENS_PER_SECOND + GEN_SECONDS_PADDING) * FRAME_RATE)
+        return estimate.toInt()
+    }
+
+    /** The reference autoregressive loop for one <=50-token chunk. [onFrame],
+     *  when set, reports (framesDone, framesTotal) on the calling thread so
+     *  callers can render degree-of-completion progress during generation. */
+    private fun generateChunk(
+        ids: IntArray,
+        framesAfterEos: Int,
+        onFrame: ((Int, Int) -> Unit)? = null,
+    ): List<FloatArray> {
         resetToVoice()
         for (id in ids) step(embRow(id), zeroNoise)
         val estimate = ceil((ids.size / TOKENS_PER_SECOND + GEN_SECONDS_PADDING) * FRAME_RATE)
@@ -653,6 +683,7 @@ class PocketTtsSynthesizer(
         var emb = bosInput
         var eosStep = -1
         for (g in 0 until maxGen) {
+            onFrame?.invoke(g + 1, maxGen)
             // force_noise0.txt: feed ZERO noise even at generation. If the GPU
             // fp16 NaN disappears with zeroed noise but returns with real
             // noise, the fault is in the flow-HEAD's noise path; if it NaNs
@@ -670,7 +701,6 @@ class PocketTtsSynthesizer(
         }
         return latents
     }
-
     /** Mimi decode: overlapped dec_tx blocks -> one-shot SEANet window. */
     private fun decode(latents: List<FloatArray>): FloatArray {
         val t = minOf(latents.size, DEC_FRAMES)
