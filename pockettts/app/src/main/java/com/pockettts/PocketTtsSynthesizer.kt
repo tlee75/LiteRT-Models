@@ -660,12 +660,14 @@ class PocketTtsSynthesizer(
         return Result(out, frames, (System.nanoTime() - t0) / 1_000_000)
     }
 
-    /** Expected generated frames for one token-chunk (mirrors generateChunk's
-     *  estimate, without the KV-capacity clamp — used only for progress ratios). */
-    private fun estFrames(ids: IntArray): Int {
-        val estimate = ceil((ids.size / TOKENS_PER_SECOND + GEN_SECONDS_PADDING) * FRAME_RATE)
-        return estimate.toInt()
-    }
+    /** Expected generated frames for one token-chunk as a PROGRESS denominator.
+     *  Uses half the generation budget: EOS typically fires at ~half the padded
+     *  estimate (the +GEN_SECONDS_PADDING tail [generateChunk] reserves for the
+     *  end-of-sentence ramp is never all generated), so a full-padded budget
+     *  would stall the readout near ~50% for the rest of the render. */
+    private fun estFrames(ids: IntArray): Int =
+        maxOf(1, (ceil((ids.size / TOKENS_PER_SECOND + GEN_SECONDS_PADDING) * FRAME_RATE)
+            .toInt() + 1) / 2)
 
     /** The reference autoregressive loop for one <=50-token chunk. [onFrame],
      *  when set, reports (framesDone, framesTotal) on the calling thread so
@@ -679,11 +681,14 @@ class PocketTtsSynthesizer(
         for (id in ids) step(embRow(id), zeroNoise)
         val estimate = ceil((ids.size / TOKENS_PER_SECOND + GEN_SECONDS_PADDING) * FRAME_RATE)
         val maxGen = minOf(estimate.toInt(), PMAX - pos - 1)
+        // Progress total mirrors estFrames (half the padded budget): EOS stops
+        // ~halfway through maxGen, so a full-budget total would stall ~50%.
+        val progTotal = maxOf(1, (estimate.toInt() + 1) / 2)
         val latents = ArrayList<FloatArray>(maxGen)
         var emb = bosInput
         var eosStep = -1
         for (g in 0 until maxGen) {
-            onFrame?.invoke(g + 1, maxGen)
+            onFrame?.invoke(g + 1, progTotal)
             // force_noise0.txt: feed ZERO noise even at generation. If the GPU
             // fp16 NaN disappears with zeroed noise but returns with real
             // noise, the fault is in the flow-HEAD's noise path; if it NaNs
