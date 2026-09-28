@@ -613,9 +613,10 @@ class PocketTtsSynthesizer(
     }
 
     /** Generate speech for `text` with the currently loaded voice. [onProgress]
-     *  (when set) reports 0..1 over the generated frames on the CALLING thread
-     *  — the Settings preview uses it to render "Generating Preview N%"; normal
-     *  reading passes nothing. */
+     *  (when set) reports 0..1 on the CALLING thread across BOTH phases — token
+     *  generation (~2/3 of the work) and Mimi audio decoding (~1/3) — so the
+     *  Settings preview readout keeps climbing instead of stalling between them.
+     *  Normal reading passes nothing. */
     fun synthesize(text: String, voice: String, onProgress: ((Float) -> Unit)? = null): Result {
         val t0 = System.nanoTime()
         if (voice == "custom" && voiceName == "custom") {
@@ -629,24 +630,44 @@ class PocketTtsSynthesizer(
         val prepared = chunks.map { prepareTextPrompt(it) }
         val idsList = prepared.map { (p, _) -> tokenizer.encode(p) }
         val ests = idsList.map { estFrames(it) }
-        val totalEst = ests.sum()
-        onProgress?.invoke(if (totalEst > 0) 0f else 1f)
-        var doneEst = 0
+        // Decode is real work too (~1/3 of wall time), so budget each chunk's
+        // audio decode separately; otherwise the readout freezes at end-of-gen.
+        val decUnits = idsList.indices.map { maxOf(1, ests[it] / 2) }
+        val genTotal = ests.sum().coerceAtLeast(0)
+        val totalUnits = (genTotal + decUnits.sum()).coerceAtLeast(1)
+        onProgress?.invoke(0f)
+        var doneUnits = 0
         for ((ci, ids) in idsList.withIndex()) {
-            val est = ests[ci]
+            val gen = ests[ci]
+            val dec = decUnits[ci]
+            val g0 = doneUnits
             val latents = generateChunk(ids, framesAfterEos = prepared[ci].second + 2) { g, gMax ->
-                if (onProgress != null && totalEst > 0 && gMax > 0) {
-                    onProgress(((doneEst + est * (g.toFloat() + 1f) / gMax) / totalEst)
+                if (onProgress != null && gMax > 0) {
+                    onProgress(((g0 + gen * (g.toFloat() + 1f) / gMax) / totalUnits)
                         .coerceIn(0f, 1f))
                 }
             }
-            doneEst += est
+            doneUnits += gen
+            val d0 = doneUnits
             android.util.Log.i(
                 "PocketTTS",
                 "chunk: ${ids.size} tokens -> ${latents.size} frames",
             )
             frames += latents.size
-            if (latents.isNotEmpty()) audio.add(decode(latents))
+            if (latents.isNotEmpty()) {
+                // Report decode progress across the decoder blocks so the
+                // readout keeps moving after the last generation frame.
+                val w0 = doneUnits
+                val a = decode(latents) { b, bTotal ->
+                    if (onProgress != null && bTotal > 0) {
+                        onProgress(((w0 + dec * (b.toFloat() + 1f) / bTotal) / totalUnits)
+                            .coerceIn(0f, 1f))
+                    }
+                }
+                doneUnits += dec
+                audio.add(a)
+            }
+            if (onProgress != null) onProgress((doneUnits / totalUnits.toFloat()).coerceIn(0f, 1f))
         }
         onProgress?.invoke(1f)   // never dangle below 100% on early-exit paths
         val total = audio.sumOf { it.size }
@@ -706,8 +727,10 @@ class PocketTtsSynthesizer(
         }
         return latents
     }
-    /** Mimi decode: overlapped dec_tx blocks -> one-shot SEANet window. */
-    private fun decode(latents: List<FloatArray>): FloatArray {
+    /** Mimi decode: overlapped dec_tx blocks -> one-shot SEANet window.
+     *  [onBlock], when set, reports (blocksDone, blocksTotal) on the calling
+     *  thread so callers can render decode-phase progress. */
+    private fun decode(latents: List<FloatArray>, onBlock: ((Int, Int) -> Unit)? = null): FloatArray {
         val t = minOf(latents.size, DEC_FRAMES)
         val feat = FloatArray(MIMI_D * S_DEC)
         val blk = FloatArray((1 + F_BLK) * LDIM)
@@ -723,7 +746,17 @@ class PocketTtsSynthesizer(
             return dectxOut[0].readFloat()               // [512 * 1024]
         }
 
+        // One initial block, then ceil((t-F_BLK)/F_HOP) overlapping blocks,
+        // then the one-shot deconly window: total = 2 + the hop count.
+        val nBlocks = 2 + maxOf(0, ((t - F_BLK + F_HOP - 1) / F_HOP))
+        var blocksDone = 0
+        fun tick() {
+            blocksDone++
+            onBlock?.invoke(blocksDone, nBlocks)
+        }
+
         var out = runBlock(neutral, 0)
+        tick()
         val n0 = minOf(F_BLK, t)
         for (c in 0 until MIMI_D)
             System.arraycopy(out, c * S_BLK, feat, c * S_DEC, n0 * UPS)
@@ -731,6 +764,7 @@ class PocketTtsSynthesizer(
         while (kept < t) {
             val start = kept - F_HOP
             out = runBlock(latents[start - 1], start)
+            tick()
             val n = minOf(F_BLK, t - start)
             val keepN = (n - F_HOP) * UPS
             for (c in 0 until MIMI_D)
@@ -741,6 +775,7 @@ class PocketTtsSynthesizer(
         deconlyIn[0].writeFloat(feat)
         deconly.run(deconlyIn, deconlyOut)
         val wav = deconlyOut[0].readFloat()
+        tick()   // the deconly window is the final block
         return FloatArray(t * SPF) { wav[it].coerceIn(-1f, 1f) }
     }
 
